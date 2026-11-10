@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prediction Bot Dashboard</title>
+    <style>
+        body { font-family: 'Inter', sans-serif; background: #0f0a1c; color: #fff; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        #game-frame { width: 100%; height: 100vh; border: none; }
+        #akm-panel { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); width: 95%; max-width: 360px; background: rgba(15, 10, 28, 0.96); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.15); border-radius: 16px; display: flex; flex-direction: column; z-index: 2147483647; box-shadow: 0 12px 35px rgba(0,0,0,0.8); overflow: hidden; color: #fff; }
+        .akm-header { background: linear-gradient(90deg, #4c1d95, #7c3aed); padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; }
+        .akm-title { font-weight: 900; font-size: 12px; }
+        .akm-nav { display: flex; gap: 4px; background: rgba(0,0,0,0.25); padding: 2px; border-radius: 6px; }
+        .akm-nav-btn { padding: 4px 10px; font-size: 10px; font-weight: 800; color: #d4d4d8; border-radius: 4px; cursor: pointer; }
+        .akm-nav-btn.active { background: #8b5cf6; color: #fff; }
+        .akm-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+        .akm-view { display: none; flex-direction: column; gap: 8px; }
+        .akm-view.active { display: flex; }
+        .akm-top-row { display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.05); padding: 6px 10px; border-radius: 8px; font-size: 11px; }
+        .akm-pred-box { background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); text-align: center; }
+        .akm-pred-val { font-size: 22px; font-weight: 900; color: #a78bfa; margin: 2px 0; }
+        .akm-stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; background: rgba(0,0,0,0.35); padding: 6px; border-radius: 10px; text-align: center; font-size: 11px; }
+        .akm-bot-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .akm-status { font-size: 9px; font-weight: 700; display: flex; align-items: center; gap: 5px; padding: 6px 10px; background: rgba(255,255,255,0.05); border-radius: 8px; }
+        .akm-dot { width: 7px; height: 7px; background: #11b981; border-radius: 50%; box-shadow: 0 0 6px #11b981; }
+        .akm-btn-main { flex: 1; padding: 8px; font-size: 12px; font-weight: 900; border: none; border-radius: 8px; color: white; cursor: pointer; text-transform: uppercase; }
+        .akm-btn-start { background: linear-gradient(135deg, #10b981, #059669); }
+        .akm-btn-stop { background: linear-gradient(135deg, #ef4444, #dc2626); }
+        .akm-cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .akm-cfg-box { display: flex; flex-direction: column; gap: 4px; background: rgba(255,255,255,0.03); padding: 6px 8px; border-radius: 8px; }
+        .akm-input { width: 100%; box-sizing: border-box; padding: 6px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; color: #fff; font-size: 11px; }
+        .akm-save-btn { width: 100%; padding: 8px; background: #8b5cf6; color: #fff; border: none; border-radius: 8px; font-weight: 800; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <!-- Embedded Game WebView / Iframe -->
+    <iframe id="game-frame" src="https://9kclub2.com/register?inviteCode=94JYSVN&from=web"></iframe>
+
+    <!-- Floating Control Panel -->
+    <div id="akm-panel">
+        <div class="akm-header">
+            <div class="akm-title">WEB PREDICTOR V5.0</div>
+            <div class="akm-nav">
+                <div class="akm-nav-btn active" id="nav-live" onclick="switchTab('live')">LIVE</div>
+                <div class="akm-nav-btn" id="nav-cfg" onclick="switchTab('cfg')">CONFIG</div>
+            </div>
+        </div>
+        <div class="akm-body">
+            <!-- LIVE TAB -->
+            <div class="akm-view active" id="view-live">
+                <div class="akm-top-row">
+                    <span id="akm-period">#SYNCING</span>
+                    <span id="akm-time" style="color: #fbbf24; font-weight:900;">00:00</span>
+                </div>
+                <div class="akm-pred-box">
+                    <span style="font-size: 8px; color: #a1a1aa;">API PREDICTION</span>
+                    <div class="akm-pred-val" id="akm-pred">WAIT</div>
+                </div>
+                <div class="akm-stats-grid">
+                    <div>BETS: <span id="st-tot">0</span></div>
+                    <div>WIN%: <span id="st-win" style="color:#34d399">0%</span></div>
+                    <div>LOSS: <span id="st-los" style="color:#f87171">0</span></div>
+                    <div>P/L: <span id="st-pro" style="color:#34d399">+0</span></div>
+                </div>
+                <div class="akm-bot-row">
+                    <div class="akm-status">
+                        <div class="akm-dot" id="akm-status-dot"></div>
+                        <span id="akm-status-txt">STANDBY</span>
+                    </div>
+                    <button id="akm-bot-btn" class="akm-btn-main akm-btn-start" onclick="toggleBot()">START BOT</button>
+                </div>
+            </div>
+
+            <!-- CONFIG TAB -->
+            <div class="akm-view" id="view-cfg">
+                <div class="akm-cfg-grid">
+                    <div class="akm-cfg-box">
+                        <span style="font-size:8px; color:#a1a1aa;">Base Bet (INR)</span>
+                        <input type="number" class="akm-input" id="akm-bet-amt" value="10">
+                    </div>
+                    <div class="akm-cfg-box">
+                        <span style="font-size:8px; color:#a1a1aa;">Trigger Type</span>
+                        <select class="akm-input" id="akm-trig-type">
+                            <option value="loss">After Losses</option>
+                            <option value="win">After Wins</option>
+                        </select>
+                    </div>
+                    <div class="akm-cfg-box">
+                        <span style="font-size:8px; color:#a1a1aa;">Trigger Count (X)</span>
+                        <input type="number" class="akm-input" id="akm-trig-count" value="3">
+                    </div>
+                    <div class="akm-cfg-box">
+                        <span style="font-size:8px; color:#a1a1aa;">Bet Mode</span>
+                        <select class="akm-input" id="akm-bet-mode">
+                            <option value="direct">Direct (As API)</option>
+                            <option value="inverse">Inverse (Opposite)</option>
+                        </select>
+                    </div>
+                </div>
+                <button class="akm-save-btn" onclick="saveConfig()">SAVE CONFIG</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tab) {
+            document.getElementById('nav-live').classList.toggle('active', tab === 'live');
+            document.getElementById('nav-cfg').classList.toggle('active', tab === 'cfg');
+            document.getElementById('view-live').classList.toggle('active', tab === 'live');
+            document.getElementById('view-cfg').classList.toggle('active', tab === 'cfg');
+        }
+
+        let isBotRunning = false;
+        let baseBet = 10, currentBet = 10;
+        let trigType = 'loss', trigCount = 3, betMode = 'direct';
+        let currentCounter = 0, isConditionMet = true;
+        let stats = { total: 0, wins: 0, losses: 0, profit: 0 };
+        let lastPeriod = '', finalPred = '';
+
+        function toggleBot() {
+            isBotRunning = !isBotRunning;
+            const btn = document.getElementById('akm-bot-btn');
+            const txt = document.getElementById('akm-status-txt');
+            if (isBotRunning) {
+                btn.innerText = "STOP BOT";
+                btn.className = "akm-btn-main akm-btn-stop";
+                txt.innerText = "ACTIVE";
+            } else {
+                btn.innerText = "START BOT";
+                btn.className = "akm-btn-main akm-btn-start";
+                txt.innerText = "STANDBY";
+            }
+        }
+
+        function saveConfig() {
+            baseBet = parseFloat(document.getElementById('akm-bet-amt').value) || 10;
+            currentBet = baseBet;
+            trigType = document.getElementById('akm-trig-type').value;
+            trigCount = parseInt(document.getElementById('akm-trig-count').value) || 3;
+            betMode = document.getElementById('akm-bet-mode').value;
+            switchTab('live');
+        }
+
+        async function fetchPrediction() {
+            try {
+                let res = await fetch('/api/get-prediction');
+                let data = await res.json();
+                if (data && data.currentPrediction) {
+                    let cur = data.currentPrediction;
+                    let pNum = cur.periodNumber;
+                    let apiPred = cur.prediction ? cur.prediction.toUpperCase() : 'WAIT';
+                    
+                    document.getElementById('akm-period').innerText = '#' + String(pNum).slice(-6);
+                    document.getElementById('akm-pred').innerText = apiPred;
+
+                    if (pNum && pNum !== lastPeriod) {
+                        lastPeriod = pNum;
+                        if (data.previousPrediction && finalPred) {
+                            checkResult(data.previousPrediction);
+                        }
+                        if (isBotRunning && apiPred) {
+                            processBet(apiPred);
+                        }
+                    }
+                }
+            } catch (err) {
+                console.log('Fetch error:', err);
+                document.getElementById('akm-pred').innerText = 'API ERR';
+            }
+        }
+
+        function checkResult(prev) {
+            let actual = prev.actualResult ? prev.actualResult.toUpperCase() : (prev.actualNumber >= 5 ? 'BIG' : 'SMALL');
+            let isWin = (finalPred === actual);
+            stats.total++;
+            if (isWin) {
+                stats.wins++;
+                stats.profit += (currentBet * 0.96);
+                currentBet = baseBet;
+            } else {
+                stats.losses++;
+                stats.profit -= currentBet;
+                currentBet = Math.round(currentBet * 2.2); // Martingale
+            }
+            updateStatsUI();
+            finalPred = '';
+        }
+
+        function processBet(apiPred) {
+            let target = (betMode === 'inverse') ? (apiPred === 'BIG' ? 'SMALL' : 'BIG') : apiPred;
+            finalPred = target;
+            console.log("Placing bet on:", target, "Amount:", currentBet);
+        }
+
+        function updateStatsUI() {
+            document.getElementById('st-tot').innerText = stats.total;
+            let winRate = stats.total > 0 ? Math.round((stats.wins / stats.total) * 100) : 0;
+            document.getElementById('st-win').innerText = winRate + '%';
+            document.getElementById('st-los').innerText = stats.losses;
+            document.getElementById('st-pro').innerText = (stats.profit >= 0 ? '+' : '') + stats.profit.toFixed(0);
+        }
+
+        // Poll API every 5 seconds[span_2](start_span)[span_2](end_span)
+        setInterval(fetchPrediction, 5000);
+        fetchPrediction();
+    </script>
+</body>
+  </html>
+  
