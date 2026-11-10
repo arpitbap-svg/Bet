@@ -7,12 +7,22 @@
     <style>
         body { font-family: 'Inter', sans-serif; background: #0f0a1c; color: #fff; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         #game-frame { width: 100%; height: 100vh; border: none; }
-        #akm-panel { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); width: 95%; max-width: 360px; background: rgba(15, 10, 28, 0.96); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.15); border-radius: 16px; display: flex; flex-direction: column; z-index: 2147483647; box-shadow: 0 12px 35px rgba(0,0,0,0.8); overflow: hidden; color: #fff; }
+        
+        /* Trigger Button when panel is hidden */
+        #akm-trigger { position: fixed; top: 0; left: 50%; transform: translateX(-50%); padding: 5px 18px; background: linear-gradient(90deg, #4c1d95, #7c3aed); border-radius: 0 0 12px 12px; display: none; align-items: center; gap: 6px; color: #fff; font-weight: 800; font-size: 11px; cursor: pointer; z-index: 2147483647; box-shadow: 0 4px 12px rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.2); border-top: none; }
+        #akm-trigger.show { display: flex; }
+
+        /* Main Panel */
+        #akm-panel { position: fixed; top: 0; left: 50%; transform: translate(-50%, -110%); width: 95%; max-width: 360px; background: rgba(15, 10, 28, 0.96); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.15); border-top: none; border-radius: 0 0 16px 16px; display: flex; flex-direction: column; z-index: 2147483647; box-shadow: 0 12px 35px rgba(0,0,0,0.8); overflow: hidden; color: #fff; transition: transform 0.3s ease-in-out; }
+        #akm-panel.open { transform: translate(-50%, 0); }
+
         .akm-header { background: linear-gradient(90deg, #4c1d95, #7c3aed); padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; }
         .akm-title { font-weight: 900; font-size: 12px; }
         .akm-nav { display: flex; gap: 4px; background: rgba(0,0,0,0.25); padding: 2px; border-radius: 6px; }
         .akm-nav-btn { padding: 4px 10px; font-size: 10px; font-weight: 800; color: #d4d4d8; border-radius: 4px; cursor: pointer; }
         .akm-nav-btn.active { background: #8b5cf6; color: #fff; }
+        .akm-hide-btn { font-size: 10px; font-weight: 900; cursor: pointer; padding: 3px 6px; color: #fff; background: rgba(0,0,0,0.25); border-radius: 4px; }
+        
         .akm-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
         .akm-view { display: none; flex-direction: column; gap: 8px; }
         .akm-view.active { display: flex; }
@@ -34,17 +44,21 @@
 </head>
 <body>
 
-    <!-- Embedded Game WebView / Iframe -->
+    <!-- Embedded Game Frame -->
     <iframe id="game-frame" src="https://9kclub2.com/register?inviteCode=94JYSVN&from=web"></iframe>
 
+    <!-- Trigger Button (Shown when panel is hidden) -->
+    <div id="akm-trigger" onclick="showPanel()"><span>▼ PREDICTOR</span></div>
+
     <!-- Floating Control Panel -->
-    <div id="akm-panel">
+    <div id="akm-panel" class="open">
         <div class="akm-header">
             <div class="akm-title">WEB PREDICTOR V5.0</div>
             <div class="akm-nav">
                 <div class="akm-nav-btn active" id="nav-live" onclick="switchTab('live')">LIVE</div>
                 <div class="akm-nav-btn" id="nav-cfg" onclick="switchTab('cfg')">CONFIG</div>
             </div>
+            <div class="akm-hide-btn" onclick="hidePanel()">HIDE</div>
         </div>
         <div class="akm-body">
             <!-- LIVE TAB -->
@@ -111,10 +125,19 @@
             document.getElementById('view-cfg').classList.toggle('active', tab === 'cfg');
         }
 
+        function hidePanel() {
+            document.getElementById('akm-panel').classList.remove('open');
+            document.getElementById('akm-trigger').classList.add('show');
+        }
+
+        function showPanel() {
+            document.getElementById('akm-panel').classList.add('open');
+            document.getElementById('akm-trigger').classList.remove('show');
+        }
+
         let isBotRunning = false;
         let baseBet = 10, currentBet = 10;
         let trigType = 'loss', trigCount = 3, betMode = 'direct';
-        let currentCounter = 0, isConditionMet = true;
         let stats = { total: 0, wins: 0, losses: 0, profit: 0 };
         let lastPeriod = '', finalPred = '';
 
@@ -126,10 +149,12 @@
                 btn.innerText = "STOP BOT";
                 btn.className = "akm-btn-main akm-btn-stop";
                 txt.innerText = "ACTIVE";
+                document.getElementById('akm-status-dot').style.background = "#ef4444";
             } else {
                 btn.innerText = "START BOT";
                 btn.className = "akm-btn-main akm-btn-start";
                 txt.innerText = "STANDBY";
+                document.getElementById('akm-status-dot').style.background = "#11b981";
             }
         }
 
@@ -190,7 +215,6 @@
         function processBet(apiPred) {
             let target = (betMode === 'inverse') ? (apiPred === 'BIG' ? 'SMALL' : 'BIG') : apiPred;
             finalPred = target;
-            console.log("Placing bet on:", target, "Amount:", currentBet);
         }
 
         function updateStatsUI() {
@@ -201,10 +225,9 @@
             document.getElementById('st-pro').innerText = (stats.profit >= 0 ? '+' : '') + stats.profit.toFixed(0);
         }
 
-        // Poll API every 5 seconds[span_2](start_span)[span_2](end_span)
+        // Poll API every 5 seconds[span_1](start_span)[span_1](end_span)
         setInterval(fetchPrediction, 5000);
         fetchPrediction();
     </script>
 </body>
-  </html>
-  
+</html>
