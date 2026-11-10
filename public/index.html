@@ -8,11 +8,9 @@
         body { font-family: 'Inter', sans-serif; background: #0f0a1c; color: #fff; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         #game-frame { width: 100%; height: 100vh; border: none; }
         
-        /* Trigger Button when panel is hidden */
         #akm-trigger { position: fixed; top: 0; left: 50%; transform: translateX(-50%); padding: 5px 18px; background: linear-gradient(90deg, #4c1d95, #7c3aed); border-radius: 0 0 12px 12px; display: none; align-items: center; gap: 6px; color: #fff; font-weight: 800; font-size: 11px; cursor: pointer; z-index: 2147483647; box-shadow: 0 4px 12px rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.2); border-top: none; }
         #akm-trigger.show { display: flex; }
 
-        /* Main Panel */
         #akm-panel { position: fixed; top: 0; left: 50%; transform: translate(-50%, -110%); width: 95%; max-width: 360px; background: rgba(15, 10, 28, 0.96); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.15); border-top: none; border-radius: 0 0 16px 16px; display: flex; flex-direction: column; z-index: 2147483647; box-shadow: 0 12px 35px rgba(0,0,0,0.8); overflow: hidden; color: #fff; transition: transform 0.3s ease-in-out; }
         #akm-panel.open { transform: translate(-50%, 0); }
 
@@ -47,7 +45,7 @@
     <!-- Embedded Game Frame -->
     <iframe id="game-frame" src="https://9kclub2.com/register?inviteCode=94JYSVN&from=web"></iframe>
 
-    <!-- Trigger Button (Shown when panel is hidden) -->
+    <!-- Trigger Button -->
     <div id="akm-trigger" onclick="showPanel()"><span>▼ PREDICTOR</span></div>
 
     <!-- Floating Control Panel -->
@@ -185,7 +183,7 @@
                             checkResult(data.previousPrediction);
                         }
                         if (isBotRunning && apiPred) {
-                            processBet(apiPred);
+                            processNewPeriodPrediction(apiPred);
                         }
                     }
                 }
@@ -212,9 +210,54 @@
             finalPred = '';
         }
 
-        function processBet(apiPred) {
-            let target = (betMode === 'inverse') ? (apiPred === 'BIG' ? 'SMALL' : 'BIG') : apiPred;
-            finalPred = target;
+        function processNewPeriodPrediction(apiPred) {
+            let targetPred = apiPred;
+            if (betMode === 'inverse') {
+                targetPred = (apiPred === 'BIG') ? 'SMALL' : 'BIG';
+            }
+            finalPred = targetPred;
+            document.getElementById('akm-status-txt').innerText = 'BETTING (' + currentBet + ')';
+            executeAutoBetSequence(targetPred);
+        }
+
+        // Auto-Bet Click Sequence for Game Elements inside Iframe/Page
+        function executeAutoBetSequence(pred) {
+            try {
+                let iframeDoc = document.getElementById('game-frame').contentDocument || document.getElementById('game-frame').contentWindow.document;
+                if (!iframeDoc) return;
+
+                function dispatchClick(node) {
+                    if (!node) return;
+                    ['pointerdown', 'mousedown', 'touchstart', 'pointerup', 'mouseup', 'touchend', 'click'].forEach(evt => {
+                        node.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+                    });
+                }
+
+                let allElements = Array.from(iframeDoc.querySelectorAll('button, div, span'));
+                let targetBtn = allElements.find(el => el.children.length === 0 && el.innerText && el.innerText.trim().toUpperCase() === pred);
+                
+                if (targetBtn) {
+                    dispatchClick(targetBtn);
+                    setTimeout(() => {
+                        let inputField = iframeDoc.querySelector('input[type="number"], input[type="tel"], input[type="text"], .van-field__control');
+                        if (inputField) {
+                            inputField.value = currentBet;
+                            inputField.dispatchEvent(new Event('input', { bubbles: true }));
+                            inputField.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        setTimeout(() => {
+                            let confirmNodes = Array.from(iframeDoc.querySelectorAll('*')).filter(el => el.innerText && el.innerText.toLowerCase().includes('total amount'));
+                            if (confirmNodes.length > 0) {
+                                let confirmSpan = confirmNodes[confirmNodes.length - 1];
+                                dispatchClick(confirmSpan);
+                                if (confirmSpan.parentElement) dispatchClick(confirmSpan.parentElement);
+                            }
+                        }, 600);
+                    }, 500);
+                }
+            } catch (e) {
+                console.log("Auto-bet execution error (CORS/Frame restriction):", e);
+            }
         }
 
         function updateStatsUI() {
@@ -225,7 +268,7 @@
             document.getElementById('st-pro').innerText = (stats.profit >= 0 ? '+' : '') + stats.profit.toFixed(0);
         }
 
-        // Poll API every 5 seconds[span_1](start_span)[span_1](end_span)
+        // Poll API every 5 seconds[span_0](start_span)[span_0](end_span)
         setInterval(fetchPrediction, 5000);
         fetchPrediction();
     </script>
