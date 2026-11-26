@@ -2,12 +2,9 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URLSearchParams } = require('url');
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
+const baileys = require('@whiskeysockets/baileys');
+const makeWASocket = baileys.default || baileys.makeWASocket;
+const { useMultiFileAuthState, DisconnectReason, Browsers } = baileys;
 const pino = require('pino');
 const cron = require('node-cron');
 const { GoogleGenAI } = require('@google/genai');
@@ -16,7 +13,7 @@ const { GoogleGenAI } = require('@google/genai');
 const ai = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY || 'AQ.Ab8RN6ImoJcdbJFs8vnUOSY_59MyUfWGAPjGscIRE1VjpuyjZw'
 });
-const PHONE_NUMBER = '918601975828';
+let currentPhoneNumber = '919369249280';
 const GROUP_NAME = 'Arpit';
 const AUTH_DIR = path.join(__dirname, 'auth_info');
 
@@ -69,7 +66,7 @@ function stopCurrentSocket() {
     }
 }
 
-function restartBot(delayMs = 3000) {
+function restartBot(delayMs = 2000) {
     stopCurrentSocket();
     reconnectTimer = setTimeout(() => {
         startBot();
@@ -82,7 +79,7 @@ async function sendToGroup(text) {
     const targetGroup = Object.values(groups).find(
         (g) => g.subject && g.subject.trim() === GROUP_NAME
     );
-    if (!targetGroup) throw new Error(`Group "${GROUP_NAME}" nahi mila!`);
+    if (!targetGroup) throw new Error(`Group "${GROUP_NAME}" nahi mila! Check karein ki ${currentPhoneNumber} is group mein add hai.`);
     await globalSock.sendMessage(targetGroup.id, { text });
 }
 
@@ -128,56 +125,12 @@ Format:
     }
 }
 
-// Web Dashboard HTML
+// Web Dashboard HTML (Live Auto-Updating QR + Logs)
 function getDashboardHTML() {
-    const logsHtml = activityLogs.map(l => `<div class="log-item">${l}</div>`).join('') || '<div class="log-item">Abhi koi activity nahi hai.</div>';
-
-    // Jab tak QR ya Pairing Code load ho raha ho, page khud 3 sec mein refresh ho
-    const isLoadingAuth = !isLinked && (
-        (!wantPairingCode && !latestQR) ||
-        (wantPairingCode && (!latestPairingCode || latestPairingCode.includes('Generating')))
-    );
-    const autoRefreshTag = isLoadingAuth ? '<meta http-equiv="refresh" content="3">' : '';
-
-    let authSection = '';
-    if (!isLinked) {
-        authSection = `<div class="auth-box">`;
-        if (!wantPairingCode) {
-            if (latestQR) {
-                const qrImgUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(latestQR)}`;
-                authSection += `
-                    <p><b>📷 WhatsApp se yeh QR Code Scan karein:</b></p>
-                    <img src="${qrImgUrl}" alt="WhatsApp QR Code" style="border: 5px solid #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);" />
-                `;
-            } else {
-                authSection += `<p>⏳ QR Code ban raha hai... (3 second mein apne aap load hoga)</p>`;
-            }
-        } else {
-            authSection += `<p><b>🔑 Apna 8-Digit Pairing Code WhatsApp mein dalein:</b></p>`;
-            authSection += `<div class="code">${latestPairingCode || 'Generating...'}</div>`;
-        }
-
-        authSection += `
-            <div class="row">
-                <div>
-                    <form method="POST" action="/get-qr">
-                        <button type="submit" class="blue">📷 Naya QR Code</button>
-                    </form>
-                </div>
-                <div>
-                    <form method="POST" action="/get-pairing">
-                        <button type="submit" class="orange">🔑 Naya Pairing Code</button>
-                    </form>
-                </div>
-            </div>
-        </div>`;
-    }
-
     return `<!DOCTYPE html>
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    ${autoRefreshTag}
     <title>Arpit Class 10 Bot</title>
     <style>
         body { font-family: sans-serif; background: #f0f2f5; margin: 0; padding: 15px; color: #222; }
@@ -186,7 +139,7 @@ function getDashboardHTML() {
         label { font-size: 13px; font-weight: bold; display: block; margin-top: 10px; color: #444; }
         .status { font-weight: bold; color: #128c7e; }
         .auth-box { text-align: center; background: #f9f9f9; padding: 15px; border-radius: 8px; margin: 10px 0; border: 1px dashed #ccc; }
-        .code { font-size: 24px; font-weight: bold; letter-spacing: 3px; color: #d32f2f; text-align: center; padding: 10px; background: #ffebee; border-radius: 8px; margin: 10px 0; }
+        .code { font-size: 26px; font-weight: bold; letter-spacing: 3px; color: #d32f2f; text-align: center; padding: 12px; background: #ffebee; border-radius: 8px; margin: 10px 0; }
         select, textarea, input, button { width: 100%; padding: 10px; margin-top: 5px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box; font-size: 15px; }
         button { background: #25d366; color: white; border: none; font-weight: bold; cursor: pointer; margin-top: 10px; }
         button.blue { background: #1976d2; }
@@ -201,10 +154,28 @@ function getDashboardHTML() {
 <body>
     <div class="card">
         <h2>🤖 Arpit Class 10 Bot</h2>
-        <p><b>Status:</b> <span class="status">${botStatus}</span></p>
+        <p><b>Status:</b> <span id="status-text" class="status">${botStatus}</span></p>
         <p><b>Group:</b> ${GROUP_NAME} | <b>Auto:</b> ${settings.autoEnabled ? '🟢 ON' : '🔴 OFF'} (${settings.time1} & ${settings.time2})</p>
-        ${authSection}
-        <a href="/"><button class="gray">🔄 Refresh Status & Logs</button></a>
+
+        <div id="auth-box" class="auth-box" style="${isLinked ? 'display:none;' : ''}">
+            <div id="qr-area" style="${wantPairingCode ? 'display:none;' : ''}">
+                <p><b>📷 WhatsApp se yeh Live QR Scan karein:</b></p>
+                <div id="qr-container">⏳ QR Code load ho raha hai...</div>
+            </div>
+            <div id="pairing-area" style="${!wantPairingCode ? 'display:none;' : ''}">
+                <p><b>🔑 Apna 8-Digit Pairing Code dalein:</b></p>
+                <div id="pairing-code-box" class="code">${latestPairingCode || 'Generating...'}</div>
+            </div>
+
+            <form method="POST" action="/get-pairing" style="margin-top:12px;">
+                <label style="text-align:left;">WhatsApp Number (91 ke saath):</label>
+                <input type="text" name="phone" value="${currentPhoneNumber}" required>
+                <button type="submit" class="orange">🔑 Is Number ka Pairing Code Banayein</button>
+            </form>
+            <form method="POST" action="/get-qr">
+                <button type="submit" class="blue">📷 Fresh QR Code Dikhayein</button>
+            </form>
+        </div>
     </div>
 
     <div class="card">
@@ -302,8 +273,47 @@ function getDashboardHTML() {
 
     <div class="card">
         <h3>📜 Live Activity Logs</h3>
-        <div class="logs">${logsHtml}</div>
+        <div id="logs-box" class="logs">Loading...</div>
     </div>
+
+    <script>
+        var lastQrRendered = '';
+        function updateLive() {
+            fetch('/api/status')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    document.getElementById('status-text').innerText = d.status;
+                    var authBox = document.getElementById('auth-box');
+                    if (d.isLinked) {
+                        authBox.style.display = 'none';
+                    } else {
+                        authBox.style.display = 'block';
+                        if (d.wantPairingCode) {
+                            document.getElementById('qr-area').style.display = 'none';
+                            document.getElementById('pairing-area').style.display = 'block';
+                            document.getElementById('pairing-code-box').innerText = d.pairingCode || 'Generating...';
+                        } else {
+                            document.getElementById('qr-area').style.display = 'block';
+                            document.getElementById('pairing-area').style.display = 'none';
+                            if (d.qr && d.qr !== lastQrRendered) {
+                                lastQrRendered = d.qr;
+                                var url = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=' + encodeURIComponent(d.qr);
+                                document.getElementById('qr-container').innerHTML = '<img src="' + url + '" style="border:5px solid #fff;border-radius:8px;" />';
+                            } else if (!d.qr) {
+                                document.getElementById('qr-container').innerText = '⏳ Naya QR Code ban raha hai...';
+                            }
+                        }
+                    }
+                    var logsHtml = d.logs.length
+                        ? d.logs.map(function(l) { return '<div class="log-item">' + l.replace(/</g, '&lt;') + '</div>'; }).join('')
+                        : '<div class="log-item">Abhi koi activity nahi hai.</div>';
+                    document.getElementById('logs-box').innerHTML = logsHtml;
+                })
+                .catch(function() {});
+        }
+        updateLive();
+        setInterval(updateLive, 3000);
+    </script>
 </body>
 </html>`;
 }
@@ -316,6 +326,18 @@ http.createServer((req, res) => {
         return res.end(getDashboardHTML());
     }
 
+    if (req.method === 'GET' && req.url === '/api/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+            status: botStatus,
+            isLinked,
+            qr: latestQR,
+            pairingCode: latestPairingCode,
+            wantPairingCode,
+            logs: activityLogs
+        }));
+    }
+
     if (req.method === 'POST') {
         let body = '';
         req.on('data', chunk => { body += chunk.toString(); });
@@ -323,18 +345,21 @@ http.createServer((req, res) => {
             const params = new URLSearchParams(body);
 
             if (req.url === '/get-pairing') {
+                let rawPhone = (params.get('phone') || currentPhoneNumber).replace(/[^0-9]/g, '');
+                if (rawPhone.length === 10) rawPhone = '91' + rawPhone;
+                currentPhoneNumber = rawPhone;
                 wantPairingCode = true;
                 latestQR = '';
                 latestPairingCode = 'Generating...';
-                botStatus = '⏳ Naya Pairing Code bana raha hu...';
-                addLog('🔄 Fresh Pairing Code request start kiya...');
+                botStatus = `⏳ ${currentPhoneNumber} ke liye Pairing Code ban raha hai...`;
+                addLog(`🔄 Fresh Pairing Code request (${currentPhoneNumber})...`);
                 clearSession();
                 restartBot(500);
             } else if (req.url === '/get-qr') {
                 wantPairingCode = false;
                 latestQR = '';
                 latestPairingCode = '';
-                botStatus = '⏳ Naya QR Code bana raha hu...';
+                botStatus = '⏳ Fresh QR Code ban raha hai...';
                 addLog('🔄 Fresh QR Code request start kiya...');
                 clearSession();
                 restartBot(500);
@@ -380,17 +405,30 @@ async function startBot() {
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
+        // Live WhatsApp Web version fetch karna
         let version;
         try {
-            const latest = await fetchLatestBaileysVersion();
-            version = latest.version;
-        } catch (e) {}
+            if (typeof baileys.fetchLatestWaWebVersion === 'function') {
+                const live = await baileys.fetchLatestWaWebVersion({});
+                if (live && live.version) version = live.version;
+            }
+            if (!version && typeof baileys.fetchLatestBaileysVersion === 'function') {
+                const latest = await baileys.fetchLatestBaileysVersion();
+                if (latest && latest.version) version = latest.version;
+            }
+            if (version) addLog(`🌐 WA Web Version: ${version.join('.')}`);
+        } catch (e) {
+            addLog('⚠️ Default WA version use kar raha hu.');
+        }
 
         const sock = makeWASocket({
             version,
             auth: state,
             logger: pino({ level: 'silent' }),
-            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            browser: Browsers ? Browsers.ubuntu('Chrome') : ['Ubuntu', 'Chrome', '20.0.04'],
+            syncFullHistory: false,
+            connectTimeoutMs: 60000,
             markOnlineOnConnect: false
         });
 
@@ -408,20 +446,20 @@ async function startBot() {
                     setTimeout(async () => {
                         if (sock !== globalSock) return;
                         try {
-                            let code = await sock.requestPairingCode(PHONE_NUMBER);
+                            let code = await sock.requestPairingCode(currentPhoneNumber);
                             code = code?.match(/.{1,4}/g)?.join('-') || code;
                             latestPairingCode = code;
-                            botStatus = '🔑 Pairing Code Ready!';
-                            addLog(`👉 Naya Pairing Code: ${code}`);
+                            botStatus = `🔑 Pairing Code Ready (${currentPhoneNumber})`;
+                            addLog(`👉 Naya Pairing Code (${currentPhoneNumber}): ${code}`);
                         } catch (err) {
                             latestPairingCode = 'Error! Dobara button dabayein.';
                             addLog(`❌ Pairing Code error: ${err.message}`);
                         }
-                    }, 1000);
+                    }, 1500);
                 } else if (!wantPairingCode) {
                     latestQR = qr;
-                    botStatus = '📷 QR Code Ready! Scan karein.';
-                    addLog('📷 Naya QR Code ready hai (http://localhost:3000 par dekhein).');
+                    botStatus = '📷 Live QR Ready! Scan karein.';
+                    addLog('📷 Fresh QR Code update hua.');
                 }
             }
 
@@ -432,12 +470,15 @@ async function startBot() {
 
                 if (statusCode === DisconnectReason.loggedOut) {
                     botStatus = 'Session Resetting...';
-                    addLog('🗑️ Purana session (401) delete karke fresh start kar raha hu...');
                     clearSession();
-                    restartBot(3000);
+                    restartBot(2000);
+                } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+                    botStatus = 'Finalizing Login...';
+                    addLog('🔄 Pairing confirm ho rahi hai, 1 sec mein reconnect...');
+                    restartBot(1000);
                 } else {
                     botStatus = 'Reconnecting...';
-                    restartBot(5000);
+                    restartBot(4000);
                 }
             }
 
@@ -468,7 +509,7 @@ async function startBot() {
         });
     } catch (err) {
         addLog(`❌ Bot start error: ${err.message}`);
-        restartBot(5000);
+        restartBot(4000);
     }
 }
 
