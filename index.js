@@ -15,6 +15,7 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 // Default Settings (Koi hardcoded API key nahi hai - 100% GitHub Safe)
 let settings = {
     geminiApiKey: '',
+    geminiModel: 'gemini-3.0-flash',
     phoneNumber: '919369249280',
     groupName: 'Arpit',
     aiNature: 'Tum ek experienced Class 10 Board Exam (UP Board / CBSE) Computer Science teacher ho. Hamesha simple, clear Hindi/Hinglish mein samjhao. Sirf wahi important Computer questions aur topics bhejo jo board paper mein baar-baar puche jate hain. WhatsApp formatting (*bold*, bullet points) use karo aur faltu lambi baatein mat likho.',
@@ -141,7 +142,8 @@ async function sendAIContent(chapter, type, count = 1) {
             throw new Error('Gemini API Key set nahi hai! Render Environment ya Web Setup se nayi key dalein.');
         }
 
-        addLog(`⏳ Computer AI se ${count} "${type}" (${chapter}) banwa raha hu...`);
+        const modelName = (settings.geminiModel || 'gemini-3.0-flash').trim();
+        addLog(`⏳ Computer AI (${modelName}) se ${count} "${type}" (${chapter}) banwa raha hu...`);
         const ai = new GoogleGenAI({ apiKey });
 
         let prompt = '';
@@ -182,7 +184,7 @@ Format:
         }
 
         const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: modelName,
             contents: prompt,
             config: {
                 systemInstruction: settings.aiNature
@@ -257,7 +259,7 @@ function getDashboardHTML() {
         <h2>💻 Class 10 Computer Board Bot</h2>
         <p><b>Status:</b> <span id="status-text" class="status">${escapeHtml(botStatus)}</span></p>
         <p><b>Group:</b> ${escapeHtml(settings.groupName)} | <b>API Key:</b> ${hasKey ? '🟢 Set hai' : '🔴 Set nahi hai'}</p>
-        <p><b>Auto-Send:</b> ${settings.autoEnabled ? '🟢 ON' : '🔴 OFF'} (${escapeHtml(settings.time1)}${settings.time2 ? ' & ' + escapeHtml(settings.time2) : ''})</p>
+        <p><b>Model:</b> ${escapeHtml(settings.geminiModel)} | <b>Auto:</b> ${settings.autoEnabled ? '🟢 ON' : '🔴 OFF'} (${escapeHtml(settings.time1)}${settings.time2 ? ' & ' + escapeHtml(settings.time2) : ''})</p>
 
         <div id="auth-box" class="auth-box" style="${isLinked ? 'display:none;' : ''}">
             <div id="qr-area" style="${wantPairingCode ? 'display:none;' : ''}">
@@ -281,10 +283,13 @@ function getDashboardHTML() {
     </div>
 
     <div class="card">
-        <h3>⚙️ Bot Setup (API Key, Group & AI Nature)</h3>
+        <h3>⚙️ Bot Setup (API Key, Model, Group & AI Nature)</h3>
         <form method="POST" action="/save-config">
             <label>Gemini API Key (${hasKey ? '🟢 Saved' : '🔴 Required'}):</label>
             <input type="password" name="geminiApiKey" placeholder="${hasKey ? 'Key set hai (badalne ke liye nayi key dalein)' : 'Apni nayi Gemini API Key (AIza...) yahan dalein'}">
+
+            <label>Gemini Model Name:</label>
+            <input type="text" name="geminiModel" value="${escapeHtml(settings.geminiModel)}" placeholder="gemini-3.0-flash" required>
 
             <label>WhatsApp Group ka Exact Naam:</label>
             <input type="text" name="groupName" value="${escapeHtml(settings.groupName)}" placeholder="Jaise: Arpit" required>
@@ -293,7 +298,7 @@ function getDashboardHTML() {
             <label>AI ka Nature / System Prompt (AI kaise jawab de):</label>
             <textarea name="aiNature" rows="4" required>${escapeHtml(settings.aiNature)}</textarea>
 
-            <button type="submit" class="purple">💾 API Key, Group & AI Nature Save Karein</button>
+            <button type="submit" class="purple">💾 Settings Save Karein</button>
         </form>
     </div>
 
@@ -449,13 +454,15 @@ http.createServer((req, res) => {
 
             if (req.url === '/save-config') {
                 const newKey = (params.get('geminiApiKey') || '').trim();
+                const newModel = (params.get('geminiModel') || '').trim();
                 const newGroup = (params.get('groupName') || '').trim();
                 const newNature = (params.get('aiNature') || '').trim();
                 if (newKey) settings.geminiApiKey = newKey;
+                if (newModel) settings.geminiModel = newModel;
                 if (newGroup) settings.groupName = newGroup;
                 if (newNature) settings.aiNature = newNature;
                 saveConfig();
-                addLog(`✅ Config saved! Group: "${settings.groupName}"${newKey ? ' (API Key Updated)' : ''}`);
+                addLog(`✅ Config saved! Group: "${settings.groupName}", Model: "${settings.geminiModel}"${newKey ? ' (API Key Updated)' : ''}`);
             } else if (req.url === '/get-pairing') {
                 let rawPhone = (params.get('phone') || settings.phoneNumber).replace(/[^0-9]/g, '');
                 if (rawPhone.length === 10) rawPhone = '91' + rawPhone;
