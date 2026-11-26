@@ -1,0 +1,14 @@
+{
+  "name": "arpit-class10-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/genai": "latest",
+    "@whiskeysockets/baileys": "latest",
+    "node-cron": "^3.0.3",
+    "pino": "^9.0.0"
+  }
+}
