@@ -1,5 +1,5 @@
 const http = require('http');
-const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const cron = require('node-cron');
 const { GoogleGenAI } = require('@google/genai');
@@ -16,7 +16,6 @@ const ai = new GoogleGenAI({
 const PHONE_NUMBER = '918601975828';
 const GROUP_NAME = 'Arpit';
 
-// Quiz bhejne ka alag function
 async function sendQuiz(sock) {
     try {
         const groups = await sock.groupFetchAllParticipating();
@@ -51,18 +50,21 @@ D) [Option 4]
 
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
+        version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
     });
 
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             const code = await sock.requestPairingCode(PHONE_NUMBER);
-            console.log('\n👉 Aapka WhatsApp Pairing Code:', code, '\n');
-        }, 3000);
+            console.log('\n👉 Naya WhatsApp Pairing Code:', code, '\n');
+        }, 5000);
     }
 
     sock.ev.on('creds.update', saveCreds);
@@ -78,13 +80,11 @@ async function startBot() {
         if (connection === 'open') {
             console.log('✅ Bot WhatsApp se connect ho gaya hai!');
 
-            // Test ke liye connect hone ke 10 second baad turant 1 quiz bheje
             setTimeout(() => {
                 console.log('⏳ Test quiz bhej raha hu...');
                 sendQuiz(sock);
             }, 10000);
 
-            // Roz subah 8 baje aur shaam 6 baje (IST)
             cron.schedule('0 8,18 * * *', () => {
                 sendQuiz(sock);
             }, {
