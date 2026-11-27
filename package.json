@@ -1,12 +1,13 @@
 {
   "name": "class10-computer-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "@google/genai": "latest",
+    "@napi-rs/canvas": "latest",
     "@whiskeysockets/baileys": "latest",
     "node-cron": "^3.0.3",
     "pino": "^9.0.0"
