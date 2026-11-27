@@ -195,6 +195,9 @@ const DEFAULT_SETTINGS = {
     phoneNumber: '919369249280',
     groupName: 'Arpit',
     aiNature: 'Tum ek experienced Class 10 UP Board Computer Science teacher ho. Hamesha simple, clear Hindi/Hinglish mein samjhao. Sirf wahi important Computer questions, MCQs aur topics bhejo jo board paper mein baar-baar puche jate hain. WhatsApp formatting (*bold*, bullet points) use karo aur faltu lambi baatein mat likho.',
+    // Slash Command (/Question) Settings
+    slashAskEnabled: true,
+    slashOnlyTargetGroup: true,
     selectedChapters: ['2', '3', '5', '9', '10', '12'],
     specificTopic: '',
     // Auto-Course Settings
@@ -207,36 +210,39 @@ const DEFAULT_SETTINGS = {
     progressLastStudyDate: '',
     // Slot 1 & Slot 2
     slot1Enabled: true,
-    slot1Time: '08:00',
+    slot1Time: '06:00',
     slot1Type: 'Short + Long Q&A (Combo)',
     slot1Count: 3,
     slot1ShortCount: 3,
     slot1LongCount: 1,
     slot2Enabled: true,
-    slot2Time: '18:00',
+    slot2Time: '16:00',
     slot2Type: 'WhatsApp Poll + Auto Answer',
     slot2Count: 5,
     slot2ShortCount: 2,
     slot2LongCount: 1,
-    // Delayed Answer Key & Leaderboard Settings
-    answerDelayMins: 90,          // 1.5 hours default (user can set 60, 90, 120 etc.)
-    minAttemptsForAnswer: 2,      // Kam se kam itne log attempt karein
+    // Delayed Answer Key, Anti-Cheat & Leaderboard Settings
+    answerDelayMins: 90,
+    minAttemptsForAnswer: 2,
+    antiCheatEnabled: true,
+    pollGapLimitSecs: 60,        // Har poll ke liye 1 minute (60 sec)
+    antiCheatTarget: 'group',    // 'group' (Naam + @Tag), 'dm' (Personal DM), 'both' (Dono)
     dailyRankEnabled: true,
-    dailyRankTime: '07:30',       // Next day morning
-    dailyRankTarget: 'yesterday', // 'yesterday' (Next day) or 'today'
+    dailyRankTime: '07:30',
+    dailyRankTarget: 'yesterday',
     weeklyRankEnabled: true,
-    weeklyRankDay: 0,             // 0 = Sunday
-    weeklyRankTime: '20:00'       // Sunday 8:00 PM
+    weeklyRankDay: 0,
+    weeklyRankTime: '20:00'
 };
 
 let settings = { ...DEFAULT_SETTINGS };
 
 let leaderboard = {
     names: {},
-    polls: {},        // pollMsgId -> { msgId, batchId, question, options, answer, explanation, encKeyBase64, creatorJid, creatorLid, dateIST, weekKey, locked, votes: { voterId: { name, option, isCorrect, at } } }
-    batches: [],      // [{ id, label, dateIST, createdAt, delayMins, minAttempts, answerSent, waitLogged, pollIds: [] }]
-    daily: {},        // 'YYYY-MM-DD' -> { voterId: { name, correct, attempted } }
-    weekly: {}        // 'YYYY-Wxx' -> { voterId: { name, correct, attempted } }
+    polls: {},
+    batches: [],
+    daily: {},
+    weekly: {}
 };
 
 function clampInt(val, min, max, fallback) {
@@ -287,7 +293,6 @@ function loadLeaderboard() {
 
 function saveLeaderboard() {
     try {
-        // Keep last 150 polls & 40 batches so file stays fast
         const pollIds = Object.keys(leaderboard.polls);
         if (pollIds.length > 150) {
             const toDelete = pollIds.slice(0, pollIds.length - 150);
@@ -323,7 +328,6 @@ function getISTParts(offsetDays = 0) {
     const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
     const dayOfWeek = dayMap[parts.weekday] ?? 0;
 
-    // ISO Week calculation (Mon–Sun)
     const utcDate = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day)));
     const dayNum = utcDate.getUTCDay() || 7;
     utcDate.setUTCDate(utcDate.getUTCDate() + 4 - dayNum);
@@ -362,9 +366,13 @@ let lastSlot2Minute = '';
 let lastDailyRankMinute = '';
 let lastWeeklyRankMinute = '';
 let availableGroups = [];
+let targetGroupId = '';
 let detectedWorkingModel = '';
 const activityLogs = [];
 const sentMessageCache = new Map();
+const processedSlashIds = new Set();
+const userSlashCooldown = new Map();
+const antiCheatTimers = new Map(); // key: `${batchId}:${voterId}` -> Timeout
 
 function addLog(msg) {
     const time = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
@@ -412,6 +420,250 @@ function formatDisplayName(voterId, fallbackName) {
     const digits = String(voterId || '').replace(/@.*$/, '').replace(/[^0-9]/g, '');
     if (digits.length >= 4) return `Student ${digits.slice(-4)}`;
     return 'Student';
+}
+
+function formatLimitText(secs) {
+    const s = clampInt(secs, 15, 600, 60);
+    if (s % 60 === 0) return `${s / 60} minute`;
+    return `${s} seconds`;
+}
+
+function extractMessageText(msg) {
+    const m = msg?.message;
+    if (!m) return '';
+    if (m.conversation) return m.conversation;
+    if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
+    if (m.imageMessage?.caption) return m.imageMessage.caption;
+    if (m.ephemeralMessage?.message) return extractMessageText({ message: m.ephemeralMessage.message });
+    if (m.viewOnceMessage?.message) return extractMessageText({ message: m.viewOnceMessage.message });
+    if (m.viewOnceMessageV2?.message) return extractMessageText({ message: m.viewOnceMessageV2.message });
+    return '';
+}
+
+// ==========================================
+// 1-Minute Poll Anti-Cheat Monitor
+// ==========================================
+function clearBatchAntiCheatTimers(batchId) {
+    const prefix = `${batchId}:`;
+    for (const [k, timer] of antiCheatTimers.entries()) {
+        if (k.startsWith(prefix)) {
+            clearTimeout(timer);
+            antiCheatTimers.delete(k);
+        }
+    }
+}
+
+async function sendAntiCheatWarning(batch, track) {
+    try {
+        if (!globalSock || !isLinked) return;
+        const limitText = formatLimitText(settings.pollGapLimitSecs);
+        const studentName = track.name || 'Student';
+        const mentionNum = String(track.mentionJid || '').split('@')[0];
+        const mentionPart = mentionNum ? `@${mentionNum} (*${studentName}*)` : `*${studentName}*`;
+
+        const groupMsg =
+            `⚠️ *Anti-Cheat Alert — ${studentName}*\n\n` +
+            `${mentionPart}, Are you trying to cheat? Your voting activity seems unusual. Please vote honestly!\n\n` +
+            `⏱️ _Har poll ko karne ka sirf ${limitText} ka samay hai._`;
+
+        const dmMsg =
+            `⚠️ *Anti-Cheat Alert — ${studentName}*\n\n` +
+            `Hi *${studentName}*, Are you trying to cheat? Your voting activity seems unusual. Please vote honestly!\n\n` +
+            `⏱️ _Har poll ko karne ka sirf ${limitText} ka samay hai._`;
+
+        const mode = settings.antiCheatTarget || 'group';
+
+        if (mode === 'group' || mode === 'both') {
+            const gId = batch.groupId || targetGroupId || (await getTargetGroup()).id;
+            await globalSock.sendMessage(gId, {
+                text: groupMsg,
+                mentions: track.mentionJid ? [track.mentionJid] : []
+            });
+            addLog(`🚨 Anti-Cheat Warning (Group) -> ${studentName} (> ${limitText} delay)`);
+        }
+
+        if (mode === 'dm' || mode === 'both') {
+            let dmSent = false;
+            if (track.dmJid && !track.dmJid.endsWith('@g.us')) {
+                try {
+                    await globalSock.sendMessage(track.dmJid, { text: dmMsg });
+                    dmSent = true;
+                    addLog(`🚨 Anti-Cheat Warning (DM) -> ${studentName} (> ${limitText} delay)`);
+                } catch (dmErr) {
+                    addLog(`⚠️ DM warning fail (${studentName}): ${dmErr.message}`);
+                }
+            }
+            // Agar DM fail ho aur mode sirf 'dm' tha, toh group fallback bhej dein
+            if (!dmSent && mode === 'dm') {
+                const gId = batch.groupId || targetGroupId || (await getTargetGroup()).id;
+                await globalSock.sendMessage(gId, {
+                    text: groupMsg,
+                    mentions: track.mentionJid ? [track.mentionJid] : []
+                });
+                addLog(`🚨 Anti-Cheat Warning (Group Fallback) -> ${studentName}`);
+            }
+        }
+    } catch (err) {
+        addLog(`❌ Anti-Cheat warning error: ${err.message}`);
+    }
+}
+
+function trackAntiCheatOnVote(poll, voterId, studentName, mentionJid, dmJid) {
+    if (!settings.antiCheatEnabled) return;
+    const batch = leaderboard.batches.find(b => b.id === poll.batchId);
+    if (!batch || !Array.isArray(batch.pollIds) || batch.pollIds.length <= 1) return;
+
+    if (!batch.voterTrack) batch.voterTrack = {};
+    const limitSecs = clampInt(settings.pollGapLimitSecs, 15, 600, 60);
+    const limitMs = limitSecs * 1000;
+    const now = Date.now();
+    const timerKey = `${batch.id}:${voterId}`;
+
+    // Purana timer clear karein
+    if (antiCheatTimers.has(timerKey)) {
+        clearTimeout(antiCheatTimers.get(timerKey));
+        antiCheatTimers.delete(timerKey);
+    }
+
+    const prev = batch.voterTrack[voterId];
+    // Backup gap check (agar server restart hone par purana timer miss hua ho)
+    if (prev && prev.lastVoteAt > 0 && (now - prev.lastVoteAt) > limitMs && !prev.warnedForLastVote) {
+        prev.name = studentName;
+        prev.mentionJid = mentionJid || prev.mentionJid;
+        prev.dmJid = dmJid || prev.dmJid;
+        prev.warnedForLastVote = true;
+        sendAntiCheatWarning(batch, prev);
+    }
+
+    // Current vote record update karein
+    batch.voterTrack[voterId] = {
+        name: studentName,
+        mentionJid: mentionJid || prev?.mentionJid || voterId,
+        dmJid: dmJid || prev?.dmJid || voterId,
+        lastVoteAt: now,
+        warnedForLastVote: false
+    };
+    saveLeaderboard();
+
+    // Check karein ki is student ke kitne polls bache hain
+    let votedCount = 0;
+    for (const pid of batch.pollIds) {
+        if (leaderboard.polls[pid]?.votes?.[voterId]) votedCount++;
+    }
+    if (votedCount >= batch.pollIds.length) {
+        // Saare polls complete ho gaye -> koi timer nahi chahiye
+        return;
+    }
+
+    // Next poll ke liye 1-minute countdown start karein
+    const timer = setTimeout(async () => {
+        antiCheatTimers.delete(timerKey);
+        const freshBatch = leaderboard.batches.find(b => b.id === batch.id);
+        if (!freshBatch) return;
+
+        // Agar quiz ke saare polls lock ho chuke hain toh warning na bhejein
+        const allLocked = freshBatch.pollIds.every(pid => leaderboard.polls[pid]?.locked);
+        if (allLocked) return;
+
+        const freshTrack = freshBatch.voterTrack?.[voterId];
+        if (!freshTrack || freshTrack.lastVoteAt !== now || freshTrack.warnedForLastVote) return;
+
+        let done = 0;
+        for (const pid of freshBatch.pollIds) {
+            if (leaderboard.polls[pid]?.votes?.[voterId]) done++;
+        }
+        if (done >= freshBatch.pollIds.length) return;
+
+        freshTrack.warnedForLastVote = true;
+        saveLeaderboard();
+        await sendAntiCheatWarning(freshBatch, freshTrack);
+    }, limitMs);
+
+    antiCheatTimers.set(timerKey, timer);
+}
+
+// ==========================================
+// Slash Command (/Question) Instant AI Reply
+// ==========================================
+async function handleSlashQuestion(msg) {
+    try {
+        if (!settings.slashAskEnabled || !globalSock || !isLinked) return;
+
+        const msgId = msg.key?.id;
+        const chatJid = msg.key?.remoteJid;
+        if (!msgId || !chatJid || chatJid === 'status@broadcast') return;
+        if (processedSlashIds.has(msgId)) return;
+
+        const rawText = extractMessageText(msg).trim();
+        if (!rawText.startsWith('/')) return;
+
+        const question = rawText.slice(1).trim();
+        if (!question) return;
+
+        const ts = Number(msg.messageTimestamp || 0);
+        if (ts > 0 && (Date.now() / 1000 - ts) > 90) return;
+
+        if (settings.slashOnlyTargetGroup) {
+            if (!targetGroupId) await refreshGroups();
+            if (!targetGroupId || chatJid !== targetGroupId) return;
+        }
+
+        const senderId = normJid(msg.key?.participantAlt || msg.key?.participant || chatJid);
+        const now = Date.now();
+        const lastUsed = userSlashCooldown.get(senderId) || 0;
+        if (now - lastUsed < 6000) return;
+        userSlashCooldown.set(senderId, now);
+
+        processedSlashIds.add(msgId);
+        if (processedSlashIds.size > 300) {
+            const first = processedSlashIds.values().next().value;
+            processedSlashIds.delete(first);
+        }
+
+        const apiKey = getActiveApiKey();
+        if (!apiKey) {
+            addLog('❌ /Question ignore hua: Gemini API Key set nahi hai.');
+            return;
+        }
+
+        const studentName = formatDisplayName(senderId, msg.pushName);
+        addLog(`💬 ${studentName} ne pucha: "/${question.slice(0, 60)}"`);
+
+        try { await globalSock.sendPresenceUpdate('composing', chatJid); } catch (e) {}
+
+        const prompt = `WhatsApp group mein ek student (${studentName}) ne yeh sawal pucha hai:
+"${question}"
+
+Iska bilkul sahi, clear aur asaan Hindi/Hinglish mein jawab do.
+Rules:
+- WhatsApp formatting (*bold*, bullet points) use karo.
+- Agar coding/C program pucha ho toh chhota aur sahi code + output do.
+- Jawab sidha aur to-the-point rakho, faltu intro ya lambi bhumika mat likho.`;
+
+        const answer = await generateWithAutoGemini(apiKey, prompt, settings.aiNature);
+
+        await globalSock.sendMessage(
+            chatJid,
+            { text: `🤖 *AI Answer*\n\n${answer}` },
+            { quoted: msg }
+        );
+
+        try { await globalSock.sendPresenceUpdate('paused', chatJid); } catch (e) {}
+
+        addLog(`✅ ${studentName} ke /question ka jawab group mein bhej diya gaya!`);
+    } catch (err) {
+        addLog(`❌ /Question error: ${err.message || err}`);
+        try {
+            const chatJid = msg.key?.remoteJid;
+            if (chatJid && globalSock) {
+                await globalSock.sendMessage(
+                    chatJid,
+                    { text: '⚠️ Abhi jawab generate karne mein thodi dikkat aayi, kripya thodi der baad dobara try karein.' },
+                    { quoted: msg }
+                );
+            }
+        } catch (e) {}
+    }
 }
 
 // ==========================================
@@ -522,7 +774,6 @@ function drawCrown(ctx, cx, bottomY) {
     ctx.fill();
     ctx.stroke();
 
-    // Crown jewels
     ctx.fillStyle = '#ffffff';
     ctx.beginPath(); ctx.arc(cx, bottomY - 28, 3.2, 0, Math.PI * 2); ctx.fill();
     ctx.beginPath(); ctx.arc(cx - 28, bottomY - 22, 2.8, 0, Math.PI * 2); ctx.fill();
@@ -540,7 +791,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
     const canvas = createCanvas(W, H);
     const ctx = canvas.getContext('2d');
 
-    // 1. Deep Emerald & Midnight Gradient Background
     const bgGrad = ctx.createLinearGradient(0, 0, W, H);
     bgGrad.addColorStop(0, '#071321');
     bgGrad.addColorStop(0.5, '#0c2330');
@@ -548,7 +798,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
     ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, W, H);
 
-    // Subtle decorative ambient glows
     const glow1 = ctx.createRadialGradient(450, 260, 20, 450, 260, 320);
     glow1.addColorStop(0, 'rgba(16, 185, 129, 0.22)');
     glow1.addColorStop(1, 'rgba(16, 185, 129, 0)');
@@ -561,13 +810,11 @@ function generateLeaderboardImage({ title, subtitle, list }) {
     ctx.fillStyle = glow2;
     ctx.fillRect(500, 0, 400, 350);
 
-    // Outer subtle card border
     drawRoundRect(ctx, 22, 22, W - 44, H - 44, 28);
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.10)';
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // 2. Header Pill + Title
     const pillW = 360;
     const pillX = (W - pillW) / 2;
     drawRoundRect(ctx, pillX, 46, pillW, 38, 19);
@@ -590,62 +837,27 @@ function generateLeaderboardImage({ title, subtitle, list }) {
     ctx.font = '600 18px sans-serif';
     ctx.fillText(subtitle, W / 2, 156);
 
-    // 3. Podium (1st Center, 2nd Left, 3rd Right)
     const podiumConfigs = [
         {
-            rank: 2,
-            entry: list[1] || null,
-            cx: 185,
-            avatarY: 322,
-            avatarR: 38,
-            boxX: 70,
-            boxY: 406,
-            boxW: 230,
-            boxH: 150,
-            accent: '#cbd5e1',
-            gradTop: '#475569',
-            gradBot: '#1e293b',
-            badgeText: '#0f172a'
+            rank: 2, entry: list[1] || null, cx: 185, avatarY: 322, avatarR: 38,
+            boxX: 70, boxY: 406, boxW: 230, boxH: 150,
+            accent: '#cbd5e1', gradTop: '#475569', gradBot: '#1e293b', badgeText: '#0f172a'
         },
         {
-            rank: 1,
-            entry: list[0] || null,
-            cx: 450,
-            avatarY: 274,
-            avatarR: 46,
-            boxX: 325,
-            boxY: 366,
-            boxW: 250,
-            boxH: 190,
-            accent: '#fbbf24',
-            gradTop: '#b45309',
-            gradBot: '#451a03',
-            badgeText: '#1c1917'
+            rank: 1, entry: list[0] || null, cx: 450, avatarY: 274, avatarR: 46,
+            boxX: 325, boxY: 366, boxW: 250, boxH: 190,
+            accent: '#fbbf24', gradTop: '#b45309', gradBot: '#451a03', badgeText: '#1c1917'
         },
         {
-            rank: 3,
-            entry: list[2] || null,
-            cx: 715,
-            avatarY: 342,
-            avatarR: 38,
-            boxX: 600,
-            boxY: 426,
-            boxW: 230,
-            boxH: 130,
-            accent: '#fb923c',
-            gradTop: '#7c2d12',
-            gradBot: '#29150e',
-            badgeText: '#1c1917'
+            rank: 3, entry: list[2] || null, cx: 715, avatarY: 342, avatarR: 38,
+            boxX: 600, boxY: 426, boxW: 230, boxH: 130,
+            accent: '#fb923c', gradTop: '#7c2d12', gradBot: '#29150e', badgeText: '#1c1917'
         }
     ];
 
     for (const p of podiumConfigs) {
-        // Crown above 1st place
-        if (p.rank === 1 && p.entry) {
-            drawCrown(ctx, p.cx, p.avatarY - p.avatarR - 10);
-        }
+        if (p.rank === 1 && p.entry) drawCrown(ctx, p.cx, p.avatarY - p.avatarR - 10);
 
-        // Podium Box
         const pGrad = ctx.createLinearGradient(p.boxX, p.boxY, p.boxX, p.boxY + p.boxH);
         pGrad.addColorStop(0, p.gradTop);
         pGrad.addColorStop(1, p.gradBot);
@@ -656,7 +868,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         ctx.lineWidth = p.rank === 1 ? 2.5 : 1.8;
         ctx.stroke();
 
-        // Big faint rank watermark inside podium
         ctx.save();
         ctx.fillStyle = 'rgba(255,255,255,0.08)';
         ctx.font = 'bold 96px sans-serif';
@@ -664,7 +875,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         ctx.fillText(String(p.rank), p.cx, p.boxY + p.boxH - 18);
         ctx.restore();
 
-        // Avatar Circle
         ctx.save();
         ctx.beginPath();
         ctx.arc(p.cx, p.avatarY, p.avatarR, 0, Math.PI * 2);
@@ -680,7 +890,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         ctx.fillText(p.entry ? getInitials(p.entry.name) : '--', p.cx, p.avatarY + (p.rank === 1 ? 10 : 8));
         ctx.restore();
 
-        // Rank Circle Badge below avatar
         const bY = p.avatarY + p.avatarR + 2;
         ctx.beginPath();
         ctx.arc(p.cx, bY, p.rank === 1 ? 17 : 15, 0, Math.PI * 2);
@@ -691,14 +900,12 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         ctx.textAlign = 'center';
         ctx.fillText(`#${p.rank}`, p.cx, bY + 5);
 
-        // Name + Score inside Podium
         ctx.textAlign = 'center';
         if (p.entry) {
             ctx.fillStyle = '#ffffff';
             ctx.font = `bold ${p.rank === 1 ? 22 : 19}px sans-serif`;
             ctx.fillText(fitText(ctx, p.entry.name, p.boxW - 24), p.cx, p.boxY + 42);
 
-            // Score pill
             const sPillW = 128;
             const sPillH = 34;
             const sPillY = p.boxY + (p.rank === 1 ? 66 : 58);
@@ -719,7 +926,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         }
     }
 
-    // 4. Remaining Ranks (#4 to #10) Below Podium
     const rest = list.slice(3, 10);
     if (rest.length > 0) {
         ctx.textAlign = 'left';
@@ -727,7 +933,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         ctx.font = 'bold 15px sans-serif';
         ctx.fillText('OTHER TOP PERFORMERS', 60, 608);
 
-        // Subtle divider line
         ctx.strokeStyle = 'rgba(255,255,255,0.12)';
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -749,13 +954,11 @@ function generateLeaderboardImage({ title, subtitle, list }) {
             ctx.lineWidth = 1.2;
             ctx.stroke();
 
-            // Rank Number
             ctx.textAlign = 'center';
             ctx.fillStyle = '#cbd5e1';
             ctx.font = 'bold 18px sans-serif';
             ctx.fillText(`#${rankNum}`, rowX + 34, rowY + 34);
 
-            // Mini Avatar
             ctx.beginPath();
             ctx.arc(rowX + 86, rowY + 28, 19, 0, Math.PI * 2);
             ctx.fillStyle = 'rgba(16, 185, 129, 0.22)';
@@ -767,13 +970,11 @@ function generateLeaderboardImage({ title, subtitle, list }) {
             ctx.font = 'bold 13px sans-serif';
             ctx.fillText(getInitials(item.name), rowX + 86, rowY + 33);
 
-            // Student Name
             ctx.textAlign = 'left';
             ctx.fillStyle = '#ffffff';
             ctx.font = 'bold 19px sans-serif';
             ctx.fillText(fitText(ctx, item.name, 310), rowX + 122, rowY + 35);
 
-            // Accuracy Progress Bar
             const barX = rowX + 455;
             const barY = rowY + 24;
             const barW = 150;
@@ -791,7 +992,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
             ctx.font = '600 13px sans-serif';
             ctx.fillText(`${item.accuracy}%`, barX + barW + 10, rowY + 33);
 
-            // Score Badge Right
             const scW = 92;
             const scX = rowX + rowW - scW - 14;
             drawRoundRect(ctx, scX, rowY + 12, scW, 32, 16);
@@ -818,7 +1018,6 @@ function generateLeaderboardImage({ title, subtitle, list }) {
         );
     }
 
-    // 5. Footer Watermark
     ctx.textAlign = 'center';
     ctx.fillStyle = '#64748b';
     ctx.font = '600 15px sans-serif';
@@ -848,7 +1047,6 @@ async function sendLeaderboardToGroup(period = 'daily', dayMode = 'yesterday', f
 
         const targetGroup = await getTargetGroup();
 
-        // Lock previous day's polls before announcing daily result
         if (period === 'daily' && dayMode === 'yesterday') {
             const yDate = getYesterdayIST();
             for (const p of Object.values(leaderboard.polls)) {
@@ -882,7 +1080,7 @@ async function sendLeaderboardToGroup(period = 'daily', dayMode = 'yesterday', f
             await globalSock.sendMessage(targetGroup.id, {
                 text: buildLeaderboardTextFallback(data)
             });
-            addLog(`⚠️ Canvas package missing — Text leaderboard bheja gaya. (package.json mein @napi-rs/canvas add karein)`);
+            addLog(`⚠️ Canvas package missing — Text leaderboard bheja gaya.`);
         }
         return true;
     } catch (err) {
@@ -928,7 +1126,6 @@ function handlePollVoteMessage(msg) {
 
         const pollEncKey = Buffer.from(poll.encKeyBase64, 'base64');
 
-        // Baileys v6 + v7 (PN & LID) dono handle karne ke liye candidate JIDs
         const creatorCandidates = [...new Set([
             poll.creatorJid,
             poll.creatorLid,
@@ -967,12 +1164,11 @@ function handlePollVoteMessage(msg) {
         }
 
         const chosenOption = matchOptionFromHashes(decrypted.selectedOptions, poll.options);
-        if (!chosenOption) return; // User ne option uncheck kiya
+        if (!chosenOption) return;
 
-        // Prefer phone JID as stable voter ID when available
-        const voterId =
-            voterCandidates.find(j => j.endsWith('@s.whatsapp.net')) ||
-            voterCandidates[0];
+        const pnJid = voterCandidates.find(j => j.endsWith('@s.whatsapp.net')) || '';
+        const rawParticipant = normJid(msg.key?.participant || msg.key?.participantAlt || msg.key?.remoteJid);
+        const voterId = pnJid || voterCandidates[0];
         if (!voterId) return;
 
         const studentName = formatDisplayName(voterId, msg.pushName);
@@ -980,7 +1176,6 @@ function handlePollVoteMessage(msg) {
             leaderboard.names[voterId] = msg.pushName.trim();
         }
 
-        // First-Vote Lock Check
         if (poll.votes[voterId]) {
             addLog(`🔒 ${studentName} ne vote change kiya — 1st vote locked hai, count nahi hua.`);
             return;
@@ -996,7 +1191,6 @@ function handlePollVoteMessage(msg) {
             at: Date.now()
         };
 
-        // Update Daily Score Bucket (Poll ke date par)
         const dKey = poll.dateIST || getTodayIST();
         if (!leaderboard.daily[dKey]) leaderboard.daily[dKey] = {};
         if (!leaderboard.daily[dKey][voterId]) {
@@ -1006,7 +1200,6 @@ function handlePollVoteMessage(msg) {
         leaderboard.daily[dKey][voterId].attempted += 1;
         if (isCorrect) leaderboard.daily[dKey][voterId].correct += 1;
 
-        // Update Weekly Score Bucket (Poll ke week par)
         const wKey = poll.weekKey || getCurrentWeekIST();
         if (!leaderboard.weekly[wKey]) leaderboard.weekly[wKey] = {};
         if (!leaderboard.weekly[wKey][voterId]) {
@@ -1018,6 +1211,11 @@ function handlePollVoteMessage(msg) {
 
         saveLeaderboard();
         addLog(`🗳️ ${studentName} ne vote lock kiya (${isCorrect ? '✅ Sahi' : '❌ Galat'})`);
+
+        // 1-Minute Anti-Cheat Timer track karein
+        const mentionJid = pnJid || rawParticipant || voterId;
+        const dmJid = pnJid || rawParticipant || voterId;
+        trackAntiCheatOnVote(poll, voterId, studentName, mentionJid, dmJid);
     } catch (err) {
         addLog(`⚠️ Vote track error: ${err.message}`);
     }
@@ -1036,6 +1234,7 @@ function getBatchUniqueVoters(batch) {
 
 async function sendBatchAnswerKey(batch) {
     try {
+        clearBatchAntiCheatTimers(batch.id);
         const polls = (batch.pollIds || [])
             .map(id => leaderboard.polls[id])
             .filter(Boolean);
@@ -1045,7 +1244,6 @@ async function sendBatchAnswerKey(batch) {
             return;
         }
 
-        // Lock all polls in this batch so late answers don't count
         const batchScores = {};
         for (const p of polls) {
             p.locked = true;
@@ -1252,21 +1450,29 @@ async function refreshGroups() {
     if (!globalSock || !isLinked) return;
     try {
         const groups = await globalSock.groupFetchAllParticipating();
-        availableGroups = Object.values(groups).map(g => g.subject).filter(Boolean);
+        const list = Object.values(groups);
+        availableGroups = list.map(g => g.subject).filter(Boolean);
+        const match = list.find(
+            g => g.subject && g.subject.trim().toLowerCase() === settings.groupName.trim().toLowerCase()
+        );
+        targetGroupId = match ? match.id : '';
     } catch (e) {}
 }
 
 async function getTargetGroup() {
     if (!globalSock || !isLinked) throw new Error('Bot abhi WhatsApp se connect nahi hai!');
     const groups = await globalSock.groupFetchAllParticipating();
-    availableGroups = Object.values(groups).map(g => g.subject).filter(Boolean);
+    const list = Object.values(groups);
+    availableGroups = list.map(g => g.subject).filter(Boolean);
 
-    const targetGroup = Object.values(groups).find(
+    const targetGroup = list.find(
         (g) => g.subject && g.subject.trim().toLowerCase() === settings.groupName.trim().toLowerCase()
     );
     if (!targetGroup) {
+        targetGroupId = '';
         throw new Error(`Group "${settings.groupName}" nahi mila! Available groups: ${availableGroups.join(', ') || 'None'}`);
     }
+    targetGroupId = targetGroup.id;
     return targetGroup;
 }
 
@@ -1439,7 +1645,6 @@ function parsePollJSON(rawText) {
                 if (s && !uniqueOpts.includes(s)) uniqueOpts.push(s);
             }
             let answer = String(item.answer || '').trim();
-            // Canonical match to one of the options
             const matchedOpt = uniqueOpts.find(
                 o => normalizeAnswerText(o) === normalizeAnswerText(answer)
             );
@@ -1486,7 +1691,6 @@ async function sendAIContent({
         const safeLong = clampInt(longCount, 0, 10, 1);
         const { label, scopeInstruction } = buildSyllabusScope(chapterIds, specificTopic, courseMeta);
 
-        // 1. Short + Long Q&A Combo Mode
         if (type === 'Short + Long Q&A (Combo)') {
             const finalShort = (safeShort === 0 && safeLong === 0) ? 2 : safeShort;
             const finalLong = (safeShort === 0 && safeLong === 0) ? 1 : safeLong;
@@ -1527,7 +1731,6 @@ Format:
             return true;
         }
 
-        // 2. Native WhatsApp Poll Mode (With Vote Tracking + 1-2 Hr Delayed Answer Key)
         if (type === 'WhatsApp Poll (MCQ)' || type === 'WhatsApp Poll + Auto Answer') {
             addLog(`⏳ AI se exact ${safeCount} WhatsApp Polls bana raha hu [${label}]...`);
             const pollPrompt = `${scopeInstruction}
@@ -1554,6 +1757,7 @@ SIRF VALID JSON ARRAY RETURN KARO, aur koi extra text mat likho. Exact JSON form
             const targetGroup = await getTargetGroup();
             const delayMins = clampInt(settings.answerDelayMins, 5, 480, 90);
             const minAttempts = clampInt(settings.minAttemptsForAnswer, 1, 50, 2);
+            const limitText = formatLimitText(settings.pollGapLimitSecs);
 
             const timeHint = delayMins >= 60
                 ? `${(delayMins / 60).toFixed(delayMins % 60 === 0 ? 0 : 1)} ghante`
@@ -1568,6 +1772,9 @@ SIRF VALID JSON ARRAY RETURN KARO, aur koi extra text mat likho. Exact JSON form
                 intro = `💻 *Class 10 Computer MCQ Quiz (${label})*\n`;
             }
             intro += `🔒 _Pehla vote hi Leaderboard mein count hoga._`;
+            if (settings.antiCheatEnabled) {
+                intro += `\n⏱️ _Har poll ko karne ka *${limitText}* ka samay hai (1 poll ke baad agle poll mein ${limitText} se zyada lagane par Anti-Cheat warning jayegi)._`;
+            }
             if (type === 'WhatsApp Poll + Auto Answer') {
                 intro += `\n⏳ _Answer Key lagbhag ${timeHint} baad bheji jayegi._`;
             }
@@ -1624,27 +1831,31 @@ SIRF VALID JSON ARRAY RETURN KARO, aur koi extra text mat likho. Exact JSON form
                 if (i < polls.length - 1) await sleep(1500);
             }
 
-            if (type === 'WhatsApp Poll + Auto Answer' && sentPollIds.length > 0) {
+            if (sentPollIds.length > 0) {
+                const autoAns = type === 'WhatsApp Poll + Auto Answer';
                 leaderboard.batches.push({
                     id: batchId,
+                    groupId: targetGroup.id,
                     label,
                     dateIST: todayInfo.dateStr,
                     createdAt: Date.now(),
                     delayMins,
                     minAttempts,
-                    answerSent: false,
+                    answerSent: !autoAns, // Sirf MCQ mode mein auto answer off rahega, par Anti-Cheat tracking chalti rahegi
                     waitLogged: false,
-                    pollIds: sentPollIds
+                    pollIds: sentPollIds,
+                    voterTrack: {}
                 });
-                addLog(`⏱️ Answer Key scheduled: ${timeHint} baad (min ${minAttempts} attempts).`);
+                if (autoAns) {
+                    addLog(`⏱️ Answer Key scheduled: ${timeHint} baad (min ${minAttempts} attempts).`);
+                }
             }
 
             saveLeaderboard();
-            addLog(`📊 ${polls.length} WhatsApp Poll(s) "${settings.groupName}" group mein bheje gaye (Vote tracking ON)!`);
+            addLog(`📊 ${polls.length} WhatsApp Poll(s) "${settings.groupName}" group mein bheje gaye (Vote + 1-Min Anti-Cheat ON)!`);
             return true;
         }
 
-        // 3. Single-type Text Modes
         addLog(`⏳ AI se ${safeCount} "${type}" bana raha hu [${label}]...`);
         let prompt = '';
         if (type === 'Important Board Topic (Notes)') {
@@ -1840,7 +2051,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         }
         .app-shell { max-width: 540px; margin: 0 auto; padding: 14px 14px 20px 14px; }
 
-        /* Hero Header */
         .hero {
             background: linear-gradient(135deg, #064e3b 0%, #0f766e 100%);
             color: #fff;
@@ -1882,7 +2092,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: #a7f3d0; font-weight: 600; }
         .stat-val { font-size: 13px; font-weight: 700; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-        /* Panels & Cards */
         .tab-panel { display: none; animation: fadeIn 0.2s ease; }
         .tab-panel.active { display: block; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
@@ -1897,7 +2106,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .pill-badge { font-size: 11px; font-weight: 700; padding: 4px 9px; border-radius: 999px; background: #ecfdf5; color: #047857; white-space: nowrap; }
         .pill-badge.off { background: #fef2f2; color: #b91c1c; }
 
-        /* Course Banner */
         .course-banner {
             background: linear-gradient(135deg, #ecfdf5 0%, #eff6ff 100%);
             border: 1px solid #bbf7d0; border-radius: 14px; padding: 14px; margin-bottom: 12px;
@@ -1910,7 +2118,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .pbar-fill { height: 100%; background: linear-gradient(90deg, #10b981, #059669); border-radius: 999px; }
         .next-hint { font-size: 12px; color: #334155; background: rgba(255,255,255,0.75); padding: 8px 10px; border-radius: 10px; margin-top: 8px; border: 1px dashed #94a3b8; }
 
-        /* Leaderboard Image Preview */
         .lb-preview-wrap {
             background: #071321;
             border-radius: 14px;
@@ -1931,7 +2138,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
             padding: 11px 12px; font-size: 12.5px; color: #78350f; margin-bottom: 10px;
         }
 
-        /* Forms */
         label.field-lbl { display: block; font-size: 12.5px; font-weight: 700; color: #334155; margin: 11px 0 5px 0; }
         input[type="text"], input[type="number"], input[type="password"], input[type="time"], select, textarea {
             width: 100%; padding: 11px 12px; border: 1.5px solid var(--border);
@@ -1942,7 +2148,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 
-        /* Buttons */
         .btn {
             width: 100%; min-height: 44px; padding: 10px 14px; border: none; border-radius: 12px;
             font-family: inherit; font-size: 13.5px; font-weight: 700; color: #fff; cursor: pointer;
@@ -1957,7 +2162,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .btn-soft { background: #e2e8f0; color: #1e293b; min-height: 36px; font-size: 12px; padding: 7px 10px; margin-top: 6px; }
         .btn-outline { background: #fff; color: #0f172a; border: 1.5px solid var(--border); min-height: 40px; font-size: 13px; }
 
-        /* Chapters & Slots */
         .ch-list { max-height: 225px; overflow-y: auto; border: 1.5px solid var(--border); border-radius: 12px; padding: 6px; background: #f8fafc; margin-top: 6px; }
         .ch-card { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 9px; cursor: pointer; font-size: 13px; font-weight: 500; color: #1e293b; }
         .ch-card:hover { background: #e2e8f0; }
@@ -1967,12 +2171,10 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .slot-card { background: #f8fafc; border: 1.5px solid var(--border); border-radius: 14px; padding: 13px; margin-bottom: 12px; }
         .slot-head { display: flex; align-items: center; justify-content: space-between; font-weight: 800; font-size: 14px; color: #0f172a; margin-bottom: 6px; }
 
-        /* Auth Box */
         .auth-box { text-align: center; background: #fffbeb; border: 1.5px dashed #f59e0b; border-radius: 16px; padding: 16px; margin-bottom: 14px; }
         .pairing-code { font-size: 28px; font-weight: 800; letter-spacing: 4px; color: #b91c1c; background: #fee2e2; padding: 14px; border-radius: 12px; margin: 10px 0; border: 1px solid #fecaca; }
         .qr-frame { display: inline-block; background: #fff; padding: 10px; border-radius: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); margin: 8px 0; }
 
-        /* Chips & Terminal */
         .chips-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
         .chip { background: #e0f2fe; color: #0369a1; border: 1px solid #bae6fd; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; cursor: pointer; }
         .hint-txt { font-size: 11.5px; color: var(--muted); margin-top: 5px; }
@@ -1989,7 +2191,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         .s-tile-time { font-size: 18px; font-weight: 800; color: var(--text); margin: 3px 0; }
         .s-tile-type { font-size: 11.5px; color: var(--muted); font-weight: 600; }
 
-        /* Clean Creator Credit Pill */
         .credit-footer { text-align: center; margin: 18px 0 6px 0; }
         .credit-pill {
             display: inline-flex; align-items: center; gap: 5px;
@@ -1998,7 +2199,6 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
         }
         .credit-pill b { color: #059669; font-weight: 800; }
 
-        /* 6-Tab Bottom Nav */
         .bottom-nav {
             position: fixed; bottom: 0; left: 0; right: 0;
             background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px);
@@ -2031,7 +2231,7 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
             <div class="hero-top">
                 <div>
                     <h1>💻 Class 10 Computer Bot</h1>
-                    <div class="hero-sub">UP Board AI Study, Polls &amp; Leaderboard</div>
+                    <div class="hero-sub">UP Board AI Study, Polls &amp; /Ask Bot</div>
                 </div>
                 <div class="status-pill">
                     <span id="status-dot" class="dot ${isLinked ? 'live' : ''}"></span>
@@ -2044,8 +2244,8 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
                     <div class="stat-val">${escapeHtml(settings.groupName)}</div>
                 </div>
                 <div class="stat-mini">
-                    <div class="stat-label">Auto-Course</div>
-                    <div class="stat-val">${settings.progressEnabled ? 'Ch ' + prog.chapter.id + ' (' + prog.coursePercent + '%)' : 'OFF'}</div>
+                    <div class="stat-label">Anti-Cheat</div>
+                    <div class="stat-val">${settings.antiCheatEnabled ? '🛡️ ' + Number(settings.pollGapLimitSecs) + 's ON' : '🔴 OFF'}</div>
                 </div>
                 <div class="stat-mini">
                     <div class="stat-label">Weekly Votes</div>
@@ -2157,7 +2357,7 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
             </div>
         </div>
 
-        <!-- TAB 2: LEADERBOARD & RANK IMAGE -->
+        <!-- TAB 2: LEADERBOARD & ANTI-CHEAT -->
         <div id="tab-rank" class="tab-panel ${currentTab === 'rank' ? 'active' : ''}">
             <div class="card">
                 <div class="card-header">
@@ -2193,9 +2393,33 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
 
             <div class="card">
                 <div class="card-header">
-                    <h3 class="card-title">⏱️ Answer Delay &amp; Auto Winner Settings</h3>
+                    <h3 class="card-title">🛡️ Anti-Cheat, Answer Delay &amp; Auto Winner</h3>
                 </div>
                 <form method="POST" action="/save-rank-settings">
+                    <div class="slot-card" style="background:#fff7ed; border-color:#fed7aa;">
+                        <div class="slot-head"><span>🚨 1-Minute Poll Anti-Cheat Alert</span></div>
+                        <div class="grid-2">
+                            <div>
+                                <label class="field-lbl">Anti-Cheat Status</label>
+                                <select name="antiCheatEnabled">
+                                    <option value="true" ${settings.antiCheatEnabled ? 'selected' : ''}>🟢 ON</option>
+                                    <option value="false" ${!settings.antiCheatEnabled ? 'selected' : ''}>🔴 OFF</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="field-lbl">Max Time / Poll (Seconds)</label>
+                                <input type="number" name="pollGapLimitSecs" min="15" max="600" value="${Number(settings.pollGapLimitSecs)}" required>
+                            </div>
+                        </div>
+                        <label class="field-lbl">Warning Message Kahan Jaye</label>
+                        <select name="antiCheatTarget">
+                            <option value="group" ${settings.antiCheatTarget === 'group' ? 'selected' : ''}>👥 Group mein (Student ka Naam + @Tag)</option>
+                            <option value="dm" ${settings.antiCheatTarget === 'dm' ? 'selected' : ''}>📩 Student ke Personal DM mein</option>
+                            <option value="both" ${settings.antiCheatTarget === 'both' ? 'selected' : ''}>📢 Dono Jagah (Group + Personal DM)</option>
+                        </select>
+                        <div class="hint-txt">1st poll ke baad next poll mein ${Number(settings.pollGapLimitSecs)} sec se zyada lagne par student ke naam ke saath cheating warning jayegi.</div>
+                    </div>
+
                     <div class="grid-2">
                         <div>
                             <label class="field-lbl">Answer Key Delay (Minutes)</label>
@@ -2249,7 +2473,7 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
                         <input type="time" name="weeklyRankTime" value="${escapeHtml(settings.weeklyRankTime)}" required>
                     </div>
 
-                    <button type="submit" class="btn btn-purple">💾 Answer Delay &amp; Leaderboard Save Karein</button>
+                    <button type="submit" class="btn btn-purple">💾 Anti-Cheat &amp; Leaderboard Save Karein</button>
                 </form>
 
                 <div class="grid-2" style="margin-top:8px;">
@@ -2503,6 +2727,27 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
                     <div id="groups-chips" class="chips-wrap"></div>
                     <div id="groups-hint" class="hint-txt">Connected hone par aapke groups yahan tap-to-select chips bankar dikhenge.</div>
 
+                    <div class="slot-card" style="margin-top:12px;">
+                        <div class="slot-head"><span>💬 /Question Instant AI Reply</span></div>
+                        <div class="grid-2">
+                            <div>
+                                <label class="field-lbl">/Command Status</label>
+                                <select name="slashAskEnabled">
+                                    <option value="true" ${settings.slashAskEnabled ? 'selected' : ''}>🟢 ON (/sawal → Instant Answer)</option>
+                                    <option value="false" ${!settings.slashAskEnabled ? 'selected' : ''}>🔴 OFF</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="field-lbl">Kahan Kaam Kare</label>
+                                <select name="slashOnlyTargetGroup">
+                                    <option value="true" ${settings.slashOnlyTargetGroup ? 'selected' : ''}>👥 Sirf Target Group</option>
+                                    <option value="false" ${!settings.slashOnlyTargetGroup ? 'selected' : ''}>🌐 Sabhi Chats/Groups</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="hint-txt">Example: Group mein koi likhe <b>/pointer kya hota hai</b> → Bot turant reply karega.</div>
+                    </div>
+
                     <label class="field-lbl">Gemini API Key (${hasKey ? '🟢 Active: ' + keySource : '🔴 Missing'})</label>
                     <input type="password" name="geminiApiKey" placeholder="${hasKey ? 'Key saved hai (badalne ke liye nayi dalein)' : 'Apni Gemini API Key (AIza...) dalein'}">
 
@@ -2733,7 +2978,7 @@ function getDashboardHTML(activeTab = 'home', toastMsg = '') {
 
                     var logsHtml = d.logs.length
                         ? d.logs.map(function(l) {
-                            var cls = l.indexOf('❌') !== -1 ? 'err' : (l.indexOf('⚠️') !== -1 ? 'warn' : '');
+                            var cls = l.indexOf('❌') !== -1 ? 'err' : (l.indexOf('⚠️') !== -1 || l.indexOf('🚨') !== -1 ? 'warn' : '');
                             return '<div class="log-row ' + cls + '">' + l.replace(/</g, '&lt;') + '</div>';
                         }).join('')
                         : '<div class="log-row">Abhi koi activity nahi hai.</div>';
@@ -2805,6 +3050,11 @@ http.createServer((req, res) => {
             let toast = '';
 
             if (pathname === '/save-rank-settings') {
+                settings.antiCheatEnabled = params.get('antiCheatEnabled') !== 'false';
+                settings.pollGapLimitSecs = clampInt(params.get('pollGapLimitSecs'), 15, 600, 60);
+                const acTarget = params.get('antiCheatTarget');
+                settings.antiCheatTarget = ['group', 'dm', 'both'].includes(acTarget) ? acTarget : 'group';
+
                 settings.answerDelayMins = clampInt(params.get('answerDelayMins'), 5, 480, 90);
                 settings.minAttemptsForAnswer = clampInt(params.get('minAttemptsForAnswer'), 1, 50, 2);
                 settings.dailyRankEnabled = params.get('dailyRankEnabled') === 'true';
@@ -2814,9 +3064,9 @@ http.createServer((req, res) => {
                 settings.weeklyRankDay = clampInt(params.get('weeklyRankDay'), 0, 6, 0);
                 settings.weeklyRankTime = params.get('weeklyRankTime') || '20:00';
                 saveConfig();
-                addLog(`🏆 Rank settings saved! Answer delay: ${settings.answerDelayMins}m (min ${settings.minAttemptsForAnswer} attempts), Daily: ${settings.dailyRankTime}, Weekly: ${WEEKDAYS[settings.weeklyRankDay]} ${settings.weeklyRankTime}`);
+                addLog(`🛡️ Anti-Cheat (${settings.antiCheatEnabled ? settings.pollGapLimitSecs + 's, ' + settings.antiCheatTarget : 'OFF'}) & Rank settings saved!`);
                 redirectTab = 'rank';
-                toast = '✅ Leaderboard & Delay settings save ho gayi!';
+                toast = '✅ Anti-Cheat & Leaderboard settings save ho gayi!';
             } else if (pathname === '/send-leaderboard') {
                 const period = params.get('period') === 'weekly' ? 'weekly' : 'daily';
                 const day = params.get('day') === 'yesterday' ? 'yesterday' : 'today';
@@ -2898,15 +3148,21 @@ http.createServer((req, res) => {
                 const newModel = (params.get('geminiModel') || 'auto').trim();
                 const newGroup = (params.get('groupName') || '').trim();
                 const newNature = (params.get('aiNature') || '').trim();
+                settings.slashAskEnabled = params.get('slashAskEnabled') !== 'false';
+                settings.slashOnlyTargetGroup = params.get('slashOnlyTargetGroup') !== 'false';
                 if (newKey) {
                     settings.geminiApiKey = newKey;
                     detectedWorkingModel = '';
                 }
                 settings.geminiModel = newModel || 'auto';
-                if (newGroup) settings.groupName = newGroup;
+                if (newGroup) {
+                    settings.groupName = newGroup;
+                    targetGroupId = '';
+                    refreshGroups();
+                }
                 if (newNature) settings.aiNature = newNature;
                 saveConfig();
-                addLog(`✅ Config saved! Group: "${settings.groupName}", Model: "${settings.geminiModel}"${newKey ? ' (API Key Updated)' : ''}`);
+                addLog(`✅ Config saved! Group: "${settings.groupName}", /Ask: ${settings.slashAskEnabled ? 'ON' : 'OFF'}`);
                 redirectTab = 'setup';
                 toast = '✅ Setup settings save ho gayi!';
             } else if (pathname === '/save-schedule') {
@@ -2918,14 +3174,14 @@ http.createServer((req, res) => {
                 settings.specificTopic = customTopic || topicSelect;
 
                 settings.slot1Enabled = params.get('slot1Enabled') === 'true';
-                settings.slot1Time = params.get('slot1Time') || '08:00';
+                settings.slot1Time = params.get('slot1Time') || '06:00';
                 settings.slot1Type = params.get('slot1Type') || 'Short + Long Q&A (Combo)';
                 settings.slot1Count = clampInt(params.get('slot1Count'), 1, 25, 3);
                 settings.slot1ShortCount = clampInt(params.get('slot1ShortCount'), 0, 15, 3);
                 settings.slot1LongCount = clampInt(params.get('slot1LongCount'), 0, 10, 1);
 
                 settings.slot2Enabled = params.get('slot2Enabled') === 'true';
-                settings.slot2Time = params.get('slot2Time') || '18:00';
+                settings.slot2Time = params.get('slot2Time') || '16:00';
                 settings.slot2Type = params.get('slot2Type') || 'WhatsApp Poll + Auto Answer';
                 settings.slot2Count = clampInt(params.get('slot2Count'), 1, 25, 5);
                 settings.slot2ShortCount = clampInt(params.get('slot2ShortCount'), 0, 15, 2);
@@ -3040,8 +3296,8 @@ async function startBot() {
         globalSock = sock;
         sock.ev.on('creds.update', saveCreds);
 
-        // Incoming Poll Votes & Student Name Tracking
-        sock.ev.on('messages.upsert', ({ messages }) => {
+        // Incoming Poll Votes + /Question Instant AI Replies
+        sock.ev.on('messages.upsert', ({ messages, type }) => {
             if (sock !== globalSock || !Array.isArray(messages)) return;
             for (const msg of messages) {
                 if (msg.pushName && msg.pushName.trim()) {
@@ -3052,6 +3308,10 @@ async function startBot() {
                 }
                 if (msg.message?.pollUpdateMessage) {
                     handlePollVoteMessage(msg);
+                    continue;
+                }
+                if (type === 'notify') {
+                    handleSlashQuestion(msg);
                 }
             }
         });
@@ -3122,10 +3382,8 @@ async function startBot() {
                         });
                         const todayInfo = getISTParts(0);
 
-                        // 1. Check 1-2 Hr Delayed Poll Answer Keys
                         checkPendingAnswerKeys();
 
-                        // 2. Slot 1 & Slot 2 Study Schedule
                         if (settings.slot1Enabled && settings.slot1Time === nowIST && lastSlot1Minute !== nowIST) {
                             lastSlot1Minute = nowIST;
                             handleScheduledSlot(
@@ -3148,13 +3406,11 @@ async function startBot() {
                             );
                         }
 
-                        // 3. Auto Daily Winner Image
                         if (settings.dailyRankEnabled && settings.dailyRankTime === nowIST && lastDailyRankMinute !== nowIST) {
                             lastDailyRankMinute = nowIST;
                             sendLeaderboardToGroup('daily', settings.dailyRankTarget, false);
                         }
 
-                        // 4. Auto Weekly Champions Image
                         if (
                             settings.weeklyRankEnabled &&
                             Number(settings.weeklyRankDay) === todayInfo.dayOfWeek &&
