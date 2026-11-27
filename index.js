@@ -7,7 +7,6 @@ const makeWASocket = baileys.default || baileys.makeWASocket;
 const { useMultiFileAuthState, DisconnectReason, Browsers } = baileys;
 const pino = require('pino');
 const cron = require('node-cron');
-const { GoogleGenAI } = require('@google/genai');
 
 const AUTH_DIR = path.join(__dirname, 'auth_info');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
@@ -15,7 +14,7 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 // Default Settings (Koi hardcoded API key nahi hai - 100% GitHub Safe)
 let settings = {
     geminiApiKey: '',
-    geminiModel: 'gemini-3.0-flash',
+    geminiModel: 'auto', // Apne aap best working model dhundh lega
     phoneNumber: '919369249280',
     groupName: 'Arpit',
     aiNature: 'Tum ek experienced Class 10 Board Exam (UP Board / CBSE) Computer Science teacher ho. Hamesha simple, clear Hindi/Hinglish mein samjhao. Sirf wahi important Computer questions aur topics bhejo jo board paper mein baar-baar puche jate hain. WhatsApp formatting (*bold*, bullet points) use karo aur faltu lambi baatein mat likho.',
@@ -47,7 +46,8 @@ function saveConfig() {
 }
 
 function getActiveApiKey() {
-    return (settings.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+    const raw = settings.geminiApiKey || process.env.GEMINI_API_KEY || '';
+    return raw.trim().replace(/^["']|["']$/g, '');
 }
 
 loadConfig();
@@ -63,6 +63,7 @@ let isLinked = false;
 let cronStarted = false;
 let lastCronMinute = '';
 let availableGroups = [];
+let detectedWorkingModel = '';
 const activityLogs = [];
 
 function addLog(msg) {
@@ -134,17 +135,126 @@ async function sendToGroup(text) {
     await globalSock.sendMessage(targetGroup.id, { text });
 }
 
+// Auto-Detect Working Gemini Model (No 404 Error)
+function scoreModel(name) {
+    const n = name.toLowerCase();
+    if (!n.includes('gemini')) return -100;
+    if (n.includes('embedding') || n.includes('imagen') || n.includes('veo') || n.includes('tts') || n.includes('audio') || n.includes('image') || n.includes('robotics') || n.includes('computer-use') || n.includes('aqa')) {
+        return -500;
+    }
+    let score = 0;
+    if (n.includes('flash')) score += 60;
+    if (n.includes('3.') || n.includes('gemini-3')) score += 50;
+    else if (n.includes('2.5')) score += 35;
+    else if (n.includes('2.0')) score += 20;
+    else if (n.includes('1.5')) score += 10;
+    if (n.includes('lite')) score -= 10;
+    if (n.includes('exp')) score -= 15;
+    if (n.includes('pro')) score += 5;
+    return score;
+}
+
+async function fetchWorkingModels(apiKey) {
+    const versions = ['v1beta', 'v1'];
+    let lastErr = '';
+
+    for (const apiVer of versions) {
+        const url = `https://generativelanguage.googleapis.com/${apiVer}/models?key=${encodeURIComponent(apiKey)}&pageSize=100`;
+        const res = await fetch(url);
+        const data = await res.json();
+
+        if (!res.ok) {
+            lastErr = data?.error?.message || `HTTP ${res.status}`;
+            if (res.status === 400 || res.status === 401 || res.status === 403) {
+                throw new Error(`API Key invalid ya blocked hai: ${lastErr}`);
+            }
+            continue;
+        }
+
+        const valid = (data.models || [])
+            .filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+            .map(m => m.name.replace(/^models\//, ''))
+            .filter(name => scoreModel(name) > -100)
+            .sort((a, b) => scoreModel(b) - scoreModel(a));
+
+        if (valid.length > 0) {
+            return { apiVer, models: valid };
+        }
+    }
+
+    throw new Error(`Koi working model nahi mila (${lastErr || 'Empty list'})`);
+}
+
+async function generateWithAutoGemini(apiKey, prompt, systemInstruction) {
+    const { apiVer, models } = await fetchWorkingModels(apiKey);
+
+    // User ne koi specific model likha ho toh pehle try karein, warna auto list use karein
+    const candidates = [];
+    const customModel = (settings.geminiModel || '').trim();
+    if (customModel && customModel.toLowerCase() !== 'auto') {
+        candidates.push(customModel.replace(/^models\//, ''));
+    }
+    if (detectedWorkingModel && !candidates.includes(detectedWorkingModel)) {
+        candidates.push(detectedWorkingModel);
+    }
+    for (const m of models) {
+        if (!candidates.includes(m)) candidates.push(m);
+    }
+
+    let lastErrorMsg = '';
+    const maxTries = Math.min(candidates.length, 6);
+
+    for (let i = 0; i < maxTries; i++) {
+        const modelName = candidates[i];
+        const endpoint = `https://generativelanguage.googleapis.com/${apiVer}/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+        const bodyPayload = {
+            contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${prompt}` }] }]
+        };
+
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(bodyPayload)
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+            const text = data?.candidates?.[0]?.content?.parts
+                ?.map(p => p.text || '')
+                .join('')
+                .trim();
+
+            if (text) {
+                if (detectedWorkingModel !== modelName) {
+                    detectedWorkingModel = modelName;
+                    addLog(`🎯 Auto-detected working model: ${modelName} (${apiVer})`);
+                }
+                return text;
+            }
+            lastErrorMsg = `Model ${modelName} ne khali jawab diya.`;
+        } else {
+            lastErrorMsg = data?.error?.message || `HTTP ${res.status}`;
+            addLog(`⚠️ Model ${modelName} skip kiya (${res.status}), agla try kar raha hu...`);
+            if (res.status === 401 || res.status === 403) {
+                throw new Error(`API Key error: ${lastErrorMsg}`);
+            }
+        }
+    }
+
+    throw new Error(lastErrorMsg || 'Sabhi models fail ho gaye.');
+}
+
 // Sirf Class 10 Board Computer AI Generator
 async function sendAIContent(chapter, type, count = 1) {
     try {
         const apiKey = getActiveApiKey();
         if (!apiKey) {
-            throw new Error('Gemini API Key set nahi hai! Render Environment ya Web Setup se nayi key dalein.');
+            throw new Error('Gemini API Key set nahi hai! Render Environment ya Web Setup mein apni key dalein.');
         }
 
-        const modelName = (settings.geminiModel || 'gemini-3.0-flash').trim();
-        addLog(`⏳ Computer AI (${modelName}) se ${count} "${type}" (${chapter}) banwa raha hu...`);
-        const ai = new GoogleGenAI({ apiKey });
+        addLog(`⏳ Computer AI se ${count} "${type}" (${chapter}) banwa raha hu...`);
 
         let prompt = '';
         if (type === 'Board MCQ Quiz') {
@@ -183,15 +293,8 @@ Format:
             prompt = `Class 10 Board Exam Computer Science ke ${count} important C Programming question (ya HTML/Logic Gate problem agar relevant ho) do, uska chhota aur bilkul sahi code/solution aur output samjhao.`;
         }
 
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: prompt,
-            config: {
-                systemInstruction: settings.aiNature
-            }
-        });
-
-        await sendToGroup(response.text);
+        const aiText = await generateWithAutoGemini(apiKey, prompt, settings.aiNature);
+        await sendToGroup(aiText);
         addLog(`✅ ${count} ${type} "${settings.groupName}" group mein bhej diya gaya!`);
     } catch (err) {
         addLog(`❌ AI/Send Error: ${err.message || err}`);
@@ -220,6 +323,7 @@ const CONTENT_TYPES = [
 // Web Dashboard HTML
 function getDashboardHTML() {
     const hasKey = Boolean(getActiveApiKey());
+    const keySource = settings.geminiApiKey ? 'Web Setup' : (process.env.GEMINI_API_KEY ? 'Render Env' : 'Not Set');
 
     const chapterOptions = COMPUTER_CHAPTERS.map(
         c => `<option value="${escapeHtml(c)}" ${settings.computerChapter === c ? 'selected' : ''}>${escapeHtml(c)}</option>`
@@ -258,8 +362,8 @@ function getDashboardHTML() {
     <div class="card">
         <h2>💻 Class 10 Computer Board Bot</h2>
         <p><b>Status:</b> <span id="status-text" class="status">${escapeHtml(botStatus)}</span></p>
-        <p><b>Group:</b> ${escapeHtml(settings.groupName)} | <b>API Key:</b> ${hasKey ? '🟢 Set hai' : '🔴 Set nahi hai'}</p>
-        <p><b>Model:</b> ${escapeHtml(settings.geminiModel)} | <b>Auto:</b> ${settings.autoEnabled ? '🟢 ON' : '🔴 OFF'} (${escapeHtml(settings.time1)}${settings.time2 ? ' & ' + escapeHtml(settings.time2) : ''})</p>
+        <p><b>Group:</b> ${escapeHtml(settings.groupName)} | <b>API Key:</b> ${hasKey ? '🟢 Set (' + keySource + ')' : '🔴 Set nahi hai'}</p>
+        <p><b>Model:</b> ${escapeHtml(detectedWorkingModel || settings.geminiModel)} | <b>Auto:</b> ${settings.autoEnabled ? '🟢 ON' : '🔴 OFF'} (${escapeHtml(settings.time1)}${settings.time2 ? ' & ' + escapeHtml(settings.time2) : ''})</p>
 
         <div id="auth-box" class="auth-box" style="${isLinked ? 'display:none;' : ''}">
             <div id="qr-area" style="${wantPairingCode ? 'display:none;' : ''}">
@@ -285,11 +389,11 @@ function getDashboardHTML() {
     <div class="card">
         <h3>⚙️ Bot Setup (API Key, Model, Group & AI Nature)</h3>
         <form method="POST" action="/save-config">
-            <label>Gemini API Key (${hasKey ? '🟢 Saved' : '🔴 Required'}):</label>
-            <input type="password" name="geminiApiKey" placeholder="${hasKey ? 'Key set hai (badalne ke liye nayi key dalein)' : 'Apni nayi Gemini API Key (AIza...) yahan dalein'}">
+            <label>Gemini API Key (${hasKey ? '🟢 Active: ' + keySource : '🔴 Required'}):</label>
+            <input type="password" name="geminiApiKey" placeholder="${hasKey ? 'Key set hai (badalne ke liye nayi key dalein)' : 'Apni Gemini API Key yahan dalein'}">
 
-            <label>Gemini Model Name:</label>
-            <input type="text" name="geminiModel" value="${escapeHtml(settings.geminiModel)}" placeholder="gemini-3.0-flash" required>
+            <label>Gemini Model (auto rakhein taaki khud working model chun le):</label>
+            <input type="text" name="geminiModel" value="${escapeHtml(settings.geminiModel)}" placeholder="auto" required>
 
             <label>WhatsApp Group ka Exact Naam:</label>
             <input type="text" name="groupName" value="${escapeHtml(settings.groupName)}" placeholder="Jaise: Arpit" required>
@@ -454,11 +558,14 @@ http.createServer((req, res) => {
 
             if (req.url === '/save-config') {
                 const newKey = (params.get('geminiApiKey') || '').trim();
-                const newModel = (params.get('geminiModel') || '').trim();
+                const newModel = (params.get('geminiModel') || 'auto').trim();
                 const newGroup = (params.get('groupName') || '').trim();
                 const newNature = (params.get('aiNature') || '').trim();
-                if (newKey) settings.geminiApiKey = newKey;
-                if (newModel) settings.geminiModel = newModel;
+                if (newKey) {
+                    settings.geminiApiKey = newKey;
+                    detectedWorkingModel = '';
+                }
+                settings.geminiModel = newModel || 'auto';
                 if (newGroup) settings.groupName = newGroup;
                 if (newNature) settings.aiNature = newNature;
                 saveConfig();
